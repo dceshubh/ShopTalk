@@ -1,0 +1,20 @@
+[tool.black]
+line-length = 110
+target-version = ["py312"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# Notebooks legitimately set sys.path before importing project modules (see 01_eda.ipynb) —
+# E402 ("import not at top") is the deliberate, documented pattern there, not a lint violation.
+"notebooks/*.ipynb" = ["E402"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

@@ -1,0 +1,506 @@
+# ShopTalk — AI-Powered Shopping Assistant
+## Master Development Plan (Phase-Gated)
+
+> **Status:** DRAFT for review — no code written yet.
+> **Author context:** Shubham Varshney (Sr SDE L6 → MLE L6). IK Advanced ML Capstone (Project 6).
+> **Goal:** Hit **100% (Excellent column)** on every rubric criterion, plus creativity add-ons (agentic, voice, memory, feedback loop) that the rubric explicitly rewards.
+> **Working rule:** We move to phase N+1 **only after** phase N's "Exit Gate" tests pass and you review them.
+
+---
+
+## 0. Strategic framing — what "Excellent" actually forces
+
+The problem doc marks fine-tuning and image models as *optional*. **The rubric does not.** The Excellent column for the 25-point "Experimentation" criterion explicitly requires:
+
+- *"In-depth fine-tuning of a language model with clear explanation of modifications"*
+- *"Integration of Language and Image Models"*
+- *"Comparisons done among multiple models"*
+
+So **fine-tuning + image captioning + multi-model comparison are mandatory** for us, even though the study guide (which targets the "Good" tier) says they're skippable.
+
+### The Excellent rubric, decoded
+
+| # | Criterion | Wt | Excellent bar | The trap (what lands you in "Good") |
+|---|-----------|----|---------------|--------------------------------------|
+| 1 | EDA & Data Prep | 15 | Profound dataset understanding; NLP preprocessing; meticulous cleaning/structuring; optimal feature engineering | Treating ABO as "just load the JSON" |
+| 2 | Experimentation w/ Models | 25 | **Fine-tuning** a language model w/ documented modifications + **Language+Image integration** + **multiple models compared** | Pretrained-only retrieval (= "Satisfactory") |
+| 3 | Deployment | 25 | Robust REST API; **model loaded once at startup**; **same data transformers as training**; **Dockerized**; deployed | Loading model per-request; notebook-only demo |
+| 4 | E2E Testing | 15 | Variety of test cases for **Correctness AND Latency (P95/P99)**; documented | Correctness only, no latency |
+| 5 | UI/UX | 5 | Working UI **with conversational history** | Single-shot Q&A, no memory |
+| 6 | Solution Documentation | 15 | Full setup + rerun steps (whole pipeline + individual tasks) + comprehensive architecture | Thin README |
+
+### The four "Excellent-only" differentiators (present in Excellent, absent in Good)
+
+1. **Actual fine-tuning** of a language/embedding model with documented modifications.
+2. **Image captioning / image-model integration** woven into the pipeline.
+3. **Multiple models compared**, with documented quantitative results.
+4. **Latency P95/P99 testing**, model **loaded once**, **same transformers** at train & inference.
+
+Every phase below is engineered to produce evidence for these.
+
+---
+
+## 1. Target architecture (end state)
+
+```
+┌──────────────── OFFLINE (build once; Colab/Kaggle GPU) ────────────────┐
+│  ABO listings JSON ─▶ [P1 Preprocess/EDA] ─▶ canonical product docs     │
+│  ABO images (256px) ─▶ [P2 Caption: BLIP-2] ─▶ visual captions ─┐       │
+│                                                                 ▼       │
+│                              enriched doc = metadata text + caption     │
+│                                                                 │       │
+│        [P4 Triplet mining] ─▶ (anchor, positive, hard-negative) │       │
+│                   │                                             ▼       │
+│        [P4 Fine-tune encoder w/ LoRA + MNR/Triplet loss]                │
+│                   │                                             │       │
+│                   ▼                                             ▼       │
+│        fine-tuned encoder ──────────────▶ [P3/P5 Embed docs] ─▶ vectors │
+│                                                                 │       │
+│                                                                 ▼       │
+│                                              [P3 Vector DB: ChromaDB]   │
+└────────────────────────────────────────────────────────────────────────┘
+                         │ artifacts: encoder weights, chroma dir, configs
+                         ▼
+┌──────────── ONLINE (AWS g4dn.xlarge; loaded ONCE at startup) ──────────┐
+│  Streamlit UI (chat + voice + product cards + filters + 👍/👎)          │
+│      │ text OR audio                                                    │
+│      ▼                                                                  │
+│ [P8 Whisper STT] ─text─▶ FastAPI /chat ─▶ ┌─ [P6/P7 LangGraph Agent] ─┐ │
+│                                           │ • history-aware rewrite   │ │
+│ [P8 Piper TTS] ◀─ text ◀──────────────────┤ • Pydantic filter extract │ │
+│      ▼                                     │ • tool: search→Chroma ANN │ │
+│  audio playback                            │ • optional cross-encoder  │ │
+│                                            │ • generator LLM (Ollama)  │ │
+│                                            │ • memory: RAM + Redis     │ │
+│  👍/👎 ─▶ SQLite/Redis ─▶ next triplet round └───────────────────────────┘ │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 2. Technology decisions & reasoning (the "why" behind every choice)
+
+### 2.1 Dataset — Amazon Berkeley Objects (ABO)
+
+| Artifact | Size | Use? | Reasoning |
+|----------|------|------|-----------|
+| `abo-listings.tar` (JSONL) | ~83 MB | ✅ Primary | name, brand, color, material, product_type, bullet_points, item_keywords, dims, `main_image_id` |
+| `abo-images-small.tar` (256px) | ~3 GB | ✅ Captioning | 256px is enough for BLIP-2; avoids ~100 GB full-res set |
+| `images.csv` | small | ✅ | Joins `main_image_id` → file path |
+| 360°/3D/renders/material maps | 100s GB | ❌ Ignore | Sparse (~8K/~7.9K products); heavy. Study-guide §9.1 says skip |
+
+**Non-obvious dataset facts (these become EDA "depth"):**
+- Listings are **multilingual** — each field is a list of `{language_tag, value}`. **Filter to `en_*`** or embeddings get polluted. (Documentable cleaning decision.)
+- ~147K products; after English + valid-image filtering expect **~100–130K** usable.
+- **Catalog-scope decision:** for the build loop, subsample a **stratified ~30–50K** slice across `product_type`. Captioning 147K on a single T4 ≈ 12–20 h; 40K ≈ **4–6 h** (budget toward the upper end for BLIP-2-2.7b). This is a *documented cost/latency trade-off*, not a corner cut. Full-catalog indexing is a stretch goal once the pipeline works.
+
+> **⚠️ TWO ASSUMPTIONS TO VERIFY IN PHASE 1 EDA — they change the plan if wrong:**
+> 1. **Price field:** ABO is a catalog/3D-asset dataset; **it very likely has NO price attribute** *(high-confidence inference, must confirm)*. The "under $50" example and any price filter depend on it. **Fallback if absent:** synthesize a documented per-product price to demo numeric structured filtering, OR drop price and filter on color/material/dimensions instead.
+> 2. **Catalog mix:** ABO **skews home/furniture/electronics, not apparel** *(high-confidence inference)*. The problem doc's apparel examples ("red shirt for men") may be sparsely represented. **Align demo queries and the golden set to the ACTUAL catalog distribution** that EDA reveals — e.g., *"a wooden coffee table under X," "a blue fabric office chair," "a minimalist floor lamp."* Furniture finish/material/shape are highly caption-friendly, so this *plays to the image-captioning strength*.
+
+**Canonical product document** (the unit we embed):
+```
+[name] · [brand] · type: [product_type] · color: [color] · material: [material]
+· [bullet_points] · keywords: [item_keywords] · visual: [BLIP-2 caption]
+```
+
+### 2.2 Models — what, why, and the comparisons that earn rubric points
+
+| Role | Primary choice | Compared against | Reasoning |
+|------|----------------|------------------|-----------|
+| **Image captioning** | BLIP-2 (`blip2-opt-2.7b`) | BLIP-base, moondream2 | BLIP-2 names visual attributes metadata omits ("red floral short-sleeve"). Comparing caption models = "multiple models" credit |
+| **Text embedding (baseline)** | `bge-base-en-v1.5` | `all-MiniLM-L6-v2`, `e5-base-v2` | bge/e5 are top retrieval encoders; MiniLM is the latency floor |
+| **Multimodal embedding (Approach 2)** | CLIP `ViT-B/32` | — | The text+image joint-space comparison point vs caption-enriched text |
+| **Embedding (fine-tuned)** | bge-base + **LoRA** | its own pretrained self | LoRA = PEFT, fits single-GPU, documented modification. This is the 25-pt centerpiece |
+| **Generator LLM** | Ollama `Qwen2.5-7B-Instruct` | `Llama-3.1-8B`, mini OpenAI | Local = cost control; 7B is plenty to phrase product results. Latency-comparable per study-guide "lighter model" rule |
+| **Reranker (optional)** | `bge-reranker-base` cross-encoder | no-rerank baseline | Precision@K lift; documented as an experiment |
+| **STT (voice in)** | `faster-whisper` (small/base) | — | Local, fast, robust |
+| **TTS (voice out)** | Piper (or Coqui XTTS) | — | Local, low-latency, natural |
+
+**Three retrieval approaches to A/B (study-guide §9.2 — and we document which wins):**
+1. **Text-only:** embed metadata; structured pre-filter (color/price) then ANN.
+2. **Text + image (caption-enriched):** Approach 1 + BLIP-2 captions appended. *(Our primary.)*
+3. **Multimodal (CLIP joint space):** image+text embeddings in one space. *(The comparison.)*
+
+> **Why caption-enrichment as primary over pure CLIP multimodal:** it reuses the entire text pipeline (one embedding space, simpler ops, easier to fine-tune) while still capturing visual info → it directly produces the "floral shirt when 'floral' isn't in metadata" win with far less complexity.
+
+### 2.3 Fine-tuning plan (the 25-point heart)
+
+- **Base:** best pretrained text encoder from Phase 3 (likely `bge-base-en-v1.5`).
+- **Method:** `sentence-transformers` (v3+, which exposes PEFT adapter support — **pin the version**) + **LoRA** → fits g4dn/T4, cheap, the "documented modification" the rubric wants. (QLoRA as the lower-memory fallback.)
+- **Loss:** `MultipleNegativesRankingLoss` (in-batch negatives, strong for retrieval) as primary; **Triplet loss** with mined hard negatives as the documented alternative. (Ties to CV3 / study-guide §4.4.)
+- **Training-data mining (no human labels needed):**
+  - **Positive pairs:** (synthetic query → product). Generate queries per product from its own metadata (e.g., "wooden mid-century coffee table") via templates + an LLM paraphraser.
+  - **Hard negatives:** same `product_type`, *different* attribute (a teal table is a hard negative for "walnut table"). This teaches fine-grained attribute separation — the exact thing pretrained models miss.
+- **Custom similarity metric (problem-doc "Optional" → we do it):** report a **query→relevant vs query→hard-negative separation margin** (the gap the fine-tune is actually trained to widen) as the primary number. *Separately* report category-level clustering (mean cosine for same-`product_type` vs different-`product_type` pairs). **Caveat (don't over-claim):** the within-category hard-negative scheme sharpens *attribute* discrimination, which can *reduce* same-category compactness — so do **not** promise "intra-category distance shrinks." The honest, defensible result is a wider relevance margin; report category clustering as-is and discuss the tension. Plot both — strong visual for the report + interview.
+- **Eval the fine-tune:** **Precision@K and MRR as primary** (a sampled golden set can't give exhaustive/graded labels, so Recall@K/NDCG are approximate — report them as such or omit). Compare **fine-tuned vs pretrained** side by side. This table is what converts criterion #2 from "Good" → "Excellent."
+- **⚠️ Eval-integrity condition (or the 25-pt result is an artifact):** the golden-set queries must be **human-written, naturalistic, and held out by *distribution*** — NOT generated by the same synthetic template used for training. Excluding only golden *products* is insufficient: if golden queries share the training template's style, the fine-tune merely learns the template and "beats pretrained" proves nothing. Write the golden queries by hand, in the style a real shopper would type.
+
+### 2.4 Vector DB — ChromaDB
+- **Why Chroma over FAISS:** built-in **metadata filtering** (structured pre-filter on color/material/type — and price *if available* — study-guide §9.2 "SQL-then-semantic"), persistence, trivial local + Docker story. FAISS is faster at huge scale but we're ≤150K vectors — Chroma's ANN (HNSW) is plenty and the metadata story is worth more here.
+- **Stored per product:** vector + metadata (`product_type`, `color`, `material`, `brand`, `product_id`, `image_path`, raw text — plus `price` **only if Phase-1 EDA confirms it exists**, else a documented synthetic price) for structured filtering and rendering product cards.
+
+### 2.5 Agentic layer — LangGraph (creativity, maps to MLE interview signal)
+- **Why an agent, not a bare RAG call:** gives us (a) **history-aware query rewriting** ("show me cheaper ones" → resolves "ones" from prior turn), (b) a **structured filter-extraction** node (Pydantic), (c) a **search tool**, (d) a **multi-turn upsell** node. This is the study-guide §9.4 "engage user in multi-turn so further sales happen."
+- **Memory tiers (study-guide §10.5):**
+  - **Short-term / working memory** — conversation buffer in RAM (per session).
+  - **Persistent memory** — **Redis**: user preferences ("I usually shop for a 5-year-old," size, budget) across sessions → powers personalization (problem-doc optional deliverable).
+- **Structured output:** Pydantic models for extracted filters (no regex on LLM text — per your global prefs).
+
+### 2.6 Voice mode (creativity — problem-doc optional deliverable)
+- **In:** `faster-whisper` transcribes mic audio → text → same `/chat` path.
+- **Out:** Piper TTS speaks the response. Toggle in UI.
+- **Reasoning:** voice in + **voice response** is an explicit optional deliverable; cheap to add once the text path is solid; strong demo-video moment.
+
+### 2.7 Deployment — the criterion #3 non-negotiables
+- **REST API:** FastAPI. **Model loaded ONCE at startup** (lifespan/`@app.on_event("startup")`), held in module state — *never* per request. (This exact phrase is in the Excellent column.)
+- **Same transformers train↔inference:** the preprocessing → canonical-doc → encoder path is one shared module imported by both the offline indexer and the online API. (Also explicit in the rubric.)
+- **Docker:** multi-stage Dockerfile; `docker-compose` for API + Redis + (optional) Ollama.
+- **Target:** AWS g4dn.xlarge (per FAQ). **Inference-time resource budget (16 GB T4 / 16 GB RAM, tight but feasible):** Qwen2.5-7B 4-bit ≈ 5–6 GB VRAM + embedding encoder ≈ 0.5 GB + cross-encoder reranker ≈ 0.5 GB + Whisper-small ≈ 1 GB → ~7–8 GB VRAM (fits). Captioning (BLIP-2) is **offline on Colab**, never on the box. Budget host RAM for FastAPI + Streamlit + Redis. If memory gets tight, drop the reranker or shrink the LLM first.
+- **HF Spaces fallback is NOT at parity:** the free tier can't comfortably host Ollama + Redis + FastAPI + Streamlit together. If used, run a **trimmed config** — hosted LLM API (or a smaller local model) and in-memory session state instead of Redis. Treat HF Spaces as a lightweight demo, AWS as the real deployment.
+
+---
+
+## 3. PHASE-GATED PLAN
+
+> Each phase has: **Goal**, **Build**, **Exit-gate tests** (what must pass), **Rubric mapping**, **Artifacts**. **Do not start a phase until the previous gate is green and you've reviewed it.**
+
+### Phase 0 — Repo, environment, scaffolding
+**Goal:** A clean, reproducible skeleton. Zero ML yet.
+**Build:**
+- Repo structure: `src/` (`preprocess/`, `embeddings/`, `captioning/`, `index/`, `agent/`, `api/`, `ui/`, `voice/`, `common/`), `notebooks/`, `tests/`, `docs/`, `data/` (gitignored), `configs/`.
+- `requirements.txt` + `environment.yml` (conda, per FAQ). Pin versions.
+- `config.yaml` (paths, model names, K, thresholds) — single source of truth.
+- Logging + a tiny `Timer` context manager (we'll reuse it for latency everywhere).
+- `.gitignore` (data/, weights/, .env). **Private repo.**
+
+**Exit-gate tests:**
+- [ ] `pip install -r requirements.txt` succeeds in a fresh venv.
+- [ ] `python -c "import src"` and a trivial `pytest` smoke test pass.
+- [ ] `pre-commit` (black/ruff) runs clean.
+
+**Rubric:** foundation for #3, #6. **Artifacts:** repo tree, configs.
+
+---
+
+### Phase 1 — Data acquisition, EDA & preprocessing
+**Goal:** Profound dataset understanding + clean canonical product docs. (Rubric #1, 15 pts.)
+**Build:**
+- Download ABO listings + small images; join `main_image_id` via `images.csv`.
+- EDA notebook: product_type distribution, color/material cardinality, text-length histos, missing-field rates, **language distribution**, image-availability rate, duplicates, before/after enrichment example.
+- Preprocessing module (`src/preprocess/`): English filter, HTML/entity strip, unit normalization, dedup, build **canonical product doc**. **This module is shared by offline + online** (rubric #3 "same transformers").
+- Stratified ~40K subsample selection (documented).
+
+**Exit-gate tests:**
+- [ ] **Schema audit (decides downstream design):** confirm whether a **price** field exists. If absent → record the chosen fallback (synthetic price vs drop price filter).
+- [ ] **Catalog-mix audit:** document the real `product_type` distribution; **choose demo-query + golden-set themes that match the dominant categories** (don't default to apparel).
+- [ ] `build_docs()` is deterministic — same input → byte-identical output (hash check).
+- [ ] 0% non-English leakage in a 200-row manual sample.
+- [ ] Every selected product has: non-empty doc + a resolvable image path (assert 100%).
+- [ ] EDA notebook renders end-to-end with ≥8 documented insights.
+- [ ] Unit tests on edge cases (missing color, empty bullets, multi-language field).
+
+**Rubric:** #1 (15). **Artifacts:** `eda.ipynb`, `products.parquet` (canonical docs), EDA findings in `docs/`.
+**REVIEW CHECKPOINT 1 →** you inspect EDA + sample docs, **and confirm the price + catalog-mix decisions**, before captioning.
+
+---
+
+### Phase 2 — Image captioning (Language+Image integration, part 1)
+**Goal:** Enrich docs with visual captions; compare ≥2 caption models. (Rubric #2.)
+**Build:**
+- `src/captioning/`: batched BLIP-2 inference on Colab/Kaggle GPU; append caption to canonical doc.
+- Compare BLIP-2 vs BLIP-base (and/or moondream2) on a 200-image sample — qualitative table + caption length/latency.
+- Optional: `rembg` background subtraction A/B on a small sample.
+
+**Exit-gate tests:**
+- [ ] 100% of selected products get a non-empty caption (with retry/fallback logged).
+- [ ] Manual review of 50 captions: ≥90% are on-topic & mention a visual attribute.
+- [ ] Documented comparison: BLIP-2 vs alternative (quality + speed) → chosen model justified.
+- [ ] Enriched docs persisted; "before vs after enrichment" diff shown for 10 products.
+
+**Rubric:** #2 (image model integration). **Artifacts:** `products_enriched.parquet`, captioning comparison doc.
+**REVIEW CHECKPOINT 2 →** you confirm captions add real signal.
+
+---
+
+### Phase 3 — Baseline retrieval: embeddings + vector DB + eval harness
+**Goal:** Working text-only + caption-enriched retrieval with a **quantitative eval harness** and **multiple pretrained models compared**. (Rubric #2, #4.)
+**Build:**
+- `src/embeddings/encode.py`: pluggable encoder (MiniLM / bge / e5), shared by offline + online.
+- `src/index/`: ChromaDB build with metadata; structured pre-filter support.
+- **Eval harness + golden test set:** **hand-write ~50–100 naturalistic (query → relevant product_ids) cases** spanning easy/hard/attribute/(price if available) queries, themed to the actual catalog (Phase 1). **Primary metrics: Precision@K and MRR**; Recall@K/NDCG reported as approximate (no exhaustive/graded labels on 40K).
+- Run the harness across 3 pretrained encoders × {text-only, caption-enriched} → comparison table.
+
+**Exit-gate tests:**
+- [ ] Index builds for full subsample; vector count == doc count.
+- [ ] Eval harness runs and prints the metric table (Precision@K, MRR primary).
+- [ ] Caption-enriched **beats** text-only on the golden set (documents the image-value win) — or, if not, documented why.
+- [ ] Structured filter works: a "blue chair" query never returns a red item or a non-chair in top-K (assert on golden cases).
+- [ ] Best pretrained encoder chosen with numbers, not vibes.
+
+**Rubric:** #2 (multiple models), #4 (correctness harness). **Artifacts:** `golden_set.json`, eval table, Chroma dir.
+**REVIEW CHECKPOINT 3 →** you approve the eval methodology before we fine-tune (so fine-tune gains are measured honestly).
+
+---
+
+### Phase 4 — Fine-tuning the embedding model (the 25-pt centerpiece)
+**Goal:** Fine-tune the encoder with LoRA; beat the pretrained baseline on the golden set; document modifications. (Rubric #2.)
+**Build:**
+- `src/embeddings/finetune/`: triplet/MNR mining (synthetic queries + hard negatives), `sentence-transformers` + LoRA training on Colab/Kaggle.
+- **Custom similarity metric:** intra- vs inter-category normalized cosine distance, with histograms (pretrained vs fine-tuned).
+- Re-index with the fine-tuned encoder; re-run the eval harness.
+
+**Exit-gate tests:**
+- [ ] Fine-tuned encoder **beats pretrained** on Precision@K / MRR on the held-out, **human-written** golden set (state the delta).
+- [ ] **Query→relevant vs query→hard-negative separation margin widens** vs pretrained (plotted). Category-level clustering reported separately (no claim that intra-category compactness improves).
+- [ ] LoRA training reproducible from a single command + config; weights versioned (path logged, not pushed to git).
+- [ ] **Eval integrity:** golden queries are human-written and distribution-disjoint from synthetic training queries; golden-set products also excluded from mining (assert both).
+- [ ] Documented "modifications": base model, LoRA rank/alpha, loss, negatives strategy, epochs, LR.
+
+**Rubric:** #2 (25) — this is the phase that moves it Good→Excellent. **Artifacts:** LoRA weights, training notebook, fine-tune-vs-pretrained report, distance histograms.
+**REVIEW CHECKPOINT 4 →** you confirm the fine-tune is a real, measured improvement.
+
+---
+
+### Phase 5 — RAG generation + LangGraph agent + memory
+**Goal:** Turn retrieval into a conversational assistant with multi-turn memory. (Rubric #5; creativity.)
+**Build:**
+- `src/agent/`: LangGraph graph — (1) history-aware query rewrite, (2) Pydantic filter extraction, (3) `search_products` tool → Chroma, (4) optional cross-encoder rerank, (5) generator LLM (Ollama Qwen2.5-7B) phrases results + asks an upsell follow-up.
+- **Memory:** short-term buffer (RAM) per session; **Redis** persistent prefs (size/budget/recipient).
+- Optional reranker A/B (Precision@K with vs without).
+
+**Exit-gate tests:**
+- [ ] Multi-turn works: "red shirt for my son" → results → "cheaper ones" correctly reuses context (scripted 5-turn test).
+- [ ] Filter extraction returns valid Pydantic objects on 20 varied queries (no parse failures).
+- [ ] Persistent pref survives a session restart (write → restart → recall).
+- [ ] Generated answers cite real retrieved `product_id`s (no hallucinated products — assert every cited id ∈ retrieved set).
+- [ ] Reranker A/B documented.
+
+**Rubric:** #5 (conversational), creativity. **Artifacts:** agent module, conversation transcripts, rerank A/B.
+**REVIEW CHECKPOINT 5 →** you test the conversation quality.
+
+---
+
+### Phase 6 — FastAPI inference service (Deployment correctness)
+**Goal:** Robust REST API meeting the rubric's exact deployment language. (Rubric #3, 25 pts.)
+**Build:**
+- FastAPI app; **models loaded ONCE at startup** (lifespan), held in app state.
+- Endpoints: `POST /chat` (session_id, message → response + product cards), `GET /health`, `GET /products/{id}`.
+- **Shared preprocessing module** imported by both indexer and API (proves "same transformers").
+- Structured error handling, request IDs, time budgets, latency logging per stage.
+
+**Exit-gate tests:**
+- [ ] Startup logs prove each model loads exactly once; a second request does **not** reload (assert via log/counter).
+- [ ] `/chat` returns valid schema for 20 queries; product cards have real ids + image paths.
+- [ ] Same query → API result == offline notebook result (transformer-parity test).
+- [ ] Graceful failure: bad input → structured 4xx, not a 500 stacktrace.
+- [ ] Concurrent requests (e.g., 10 parallel) don't corrupt session memory.
+
+**Rubric:** #3 (25). **Artifacts:** API module, OpenAPI schema, parity test.
+**REVIEW CHECKPOINT 6 →** you hit the API and confirm load-once + parity.
+
+---
+
+### Phase 7 — Streamlit UI (with conversational history)
+**Goal:** Consumable UI with chat history, product cards, filters, feedback. (Rubric #5.)
+**Build:**
+- Streamlit chat UI: message history rendered, product cards (image + name + [price if available] + id + link), sidebar structured filters (color/material/type, + price if available), **👍/👎 feedback** buttons.
+- Calls the FastAPI backend (not in-process) — clean separation.
+- Feedback persisted (SQLite/Redis) → feeds Phase 9 feedback loop.
+
+**Exit-gate tests:**
+- [ ] Conversation history visibly persists across turns in the UI.
+- [ ] Product cards render image + id + clickable identifier (rubric: "product identifier displayed").
+- [ ] Filters change results correctly.
+- [ ] 👍/👎 writes a record (query, product_id, verdict, ts).
+- [ ] Usability pass: a fresh user completes a search in <30s without instructions.
+
+**Rubric:** #5 (5). **Artifacts:** UI app, screenshots.
+**REVIEW CHECKPOINT 7 →** you click through the app.
+
+---
+
+### Phase 8 — Voice mode (creativity / optional deliverable)
+**Goal:** Voice input + voice response. (Problem-doc optional deliverable; demo gold.)
+**Build:**
+- `src/voice/`: `faster-whisper` STT (mic/audio upload → text → `/chat`); Piper TTS (response text → audio). UI toggle + audio playback.
+
+**Exit-gate tests:**
+- [ ] Spoken "show me a red dress" → correct transcription → correct results.
+- [ ] Response is spoken back intelligibly.
+- [ ] STT + TTS latency measured and within a stated budget (e.g., <2s each).
+- [ ] Falls back gracefully to text if mic/audio unavailable.
+
+**Rubric:** creativity (graded). **Artifacts:** voice module, demo clip.
+**REVIEW CHECKPOINT 8 →** optional; skip if time-boxed (it's a stretch, not a rubric core).
+
+---
+
+### Phase 9 — Feedback loop & personalization (stretch / creativity)
+**Goal:** Use 👍/👎 + history for personalization and a retraining signal. (Problem-doc optional.)
+**Build:**
+- Aggregate 👎 into hard-negative candidates → feed next triplet-mining round (closes the loop to Phase 4).
+- Personalization: bias retrieval/rerank using Redis user prefs + past 👍 products.
+
+**Exit-gate tests:**
+- [ ] A 👎'd product is demonstrably down-ranked for that user on the next similar query.
+- [ ] Re-mining from feedback produces valid training triplets.
+- [ ] Personalized vs non-personalized results differ for a user with history (documented).
+
+**Rubric:** creativity. **Artifacts:** feedback store, personalization note.
+
+---
+
+### Phase 10 — E2E testing: correctness + latency P95/P99 (Rubric #4)
+**Goal:** Variety of test cases for correctness AND latency, documented. (Rubric #4, 15 pts.)
+**Build:**
+- Correctness suite: easy/hard/attribute/price/multi-turn/ambiguous/empty/typo queries vs expected behavior.
+- **Latency benchmark:** run N=200+ queries through the live API; record per-stage (embed, retrieve, rerank, generate) and end-to-end; compute **P50/P95/P99**.
+- Latency comparison across generator LLMs (Qwen vs Llama) on g4dn — the study-guide "compare LLMs on latency" point.
+
+**Exit-gate tests:**
+- [ ] Correctness suite passes / documented pass-rate per category.
+- [ ] **P95 and P99** reported end-to-end and per-stage, in a table.
+- [ ] Bottleneck identified (likely LLM generation) + at least one mitigation tried (streaming, smaller model, caching) with before/after numbers.
+- [ ] Results written to `docs/`.
+
+**Rubric:** #4 (15). **Artifacts:** test suite, latency report, plots.
+**REVIEW CHECKPOINT 10 →** you review the latency numbers.
+
+---
+
+### Phase 11 — Dockerization & AWS deployment (Rubric #3)
+**Goal:** Reproducible container + live deployment. (Rubric #3.)
+**Build:**
+- Multi-stage Dockerfile; `docker-compose` (API + Redis + Ollama). Model artifacts mounted/baked.
+- Deploy to AWS g4dn.xlarge; smoke-test the live endpoint. HF Spaces fallback.
+
+**Exit-gate tests:**
+- [ ] `docker compose up` brings the whole stack up on a clean machine; UI reachable.
+- [ ] Live AWS endpoint answers a query end-to-end (with voice if enabled).
+- [ ] Documented run steps reproduce the deployment from scratch.
+- [ ] Model still loads once inside the container (not per request).
+
+**Rubric:** #3 (25, Docker = explicit bonus). **Artifacts:** Dockerfile, compose, deploy runbook.
+**REVIEW CHECKPOINT 11 →** you spin it up from the runbook.
+
+---
+
+### Phase 12 — Documentation, architecture doc & demo video (Rubric #6)
+**Goal:** Comprehensive docs + demo video. (Rubric #6, 15 pts.)
+**Build:**
+- `README.md`: setup, env, run-whole-pipeline + run-individual-tasks, requirements.txt, dataset download.
+- `ARCHITECTURE.md`: system diagram, each component's role, data flow, model choices + reasoning, **what worked / what didn't**, experiments table (caption models, encoders, fine-tune deltas, rerank, latency).
+- Demo video covering every capability (chat, voice, filters, multi-turn, feedback, observability).
+
+**Exit-gate tests:**
+- [ ] A reviewer follows the README on a clean machine and runs the pipeline + service unaided.
+- [ ] Architecture doc explains every box in the diagram.
+- [ ] Experiments table present (the "comparisons" evidence for rubric #2).
+- [ ] Demo video shows all features.
+
+**Rubric:** #6 (15) + reinforces #2/#3/#4. **Artifacts:** README, ARCHITECTURE.md, video.
+
+---
+
+## 4. Phase → rubric coverage matrix
+
+| Phase | #1 EDA | #2 Models | #3 Deploy | #4 E2E | #5 UI | #6 Docs | Creativity |
+|-------|:-----:|:---------:|:---------:|:------:|:-----:|:-------:|:----------:|
+| 0 Scaffold | | | ● | | | ● | |
+| 1 EDA/Preprocess | ●●● | | ○ | | | ○ | |
+| 2 Captioning | | ●● | | | | ○ | |
+| 3 Baseline+Eval | | ●● | | ● | | ○ | |
+| 4 Fine-tune | | ●●● | | ○ | | ○ | |
+| 5 Agent/Memory | | ○ | | | ●● | ○ | ●● |
+| 6 FastAPI | | | ●●● | ○ | | ○ | |
+| 7 Streamlit UI | | | | | ●●● | ○ | ○ |
+| 8 Voice | | | | | ○ | | ●●● |
+| 9 Feedback/Person. | | ○ | | | | | ●●● |
+| 10 E2E+Latency | | | ○ | ●●● | | ● | |
+| 11 Docker/AWS | | | ●●● | | | ● | |
+| 12 Docs/Video | ○ | ● | ● | ● | | ●●● | |
+
+(●●● primary, ● contributes, ○ touches)
+
+---
+
+## 5. The "Excellent-only" evidence checklist (print this; tick before submission)
+
+- [ ] **Fine-tuning:** documented base model + LoRA config + loss + negatives + **fine-tuned beats pretrained** on golden set (numbers). *(Phase 4)*
+- [ ] **Language+Image integration:** BLIP-2 captions enrich docs; caption-enriched beats text-only. *(Phase 2,3)*
+- [ ] **Multiple models compared:** caption models, ≥3 encoders, fine-tuned vs pretrained, generator LLMs (latency). *(Phase 2,3,4,10)*
+- [ ] **Model loaded once at startup**, not per request — proven by logs. *(Phase 6)*
+- [ ] **Same transformers train↔inference** — shared preprocessing module + parity test. *(Phase 1,6)*
+- [ ] **Dockerized + deployed** on AWS. *(Phase 11)*
+- [ ] **P95/P99 latency** measured + bottleneck mitigation. *(Phase 10)*
+- [ ] **Conversational history** in UI. *(Phase 5,7)*
+- [ ] **Comprehensive docs + architecture + run steps + demo video.** *(Phase 12)*
+
+---
+
+## 6. Risks & mitigations
+
+| Risk | Impact | Mitigation |
+|------|--------|------------|
+| **ABO has no price field** | Breaks price filter + "under $50" demo | Phase-1 gate verifies; fallback = synthetic price (documented) or drop price, filter on color/material/dims |
+| **ABO skews home/furniture, not apparel** | Apparel demos fall flat | Phase-1 gate sets demo + golden themes to real catalog mix; furniture is caption-friendly (turns into a strength) |
+| **Fine-tune eval circularity** | 25-pt result becomes an artifact | Golden queries human-written, distribution-disjoint from synthetic training queries (Phase-4 gate) |
+| Captioning 147K too slow | Schedule | Stratified 40K subsample (documented); full-catalog = stretch |
+| Fine-tune doesn't beat baseline | Rubric #2 | Hard-negative mining is the key lever; if flat, try triplet + more epochs + better negatives; document honestly either way |
+| Single-GPU memory limits | Build | LoRA + QLoRA, batch sizing, 256px images, bge-base (not large) |
+| LLM generation latency dominates P99 | Rubric #4 | Streaming, smaller model, response caching, retrieval-only fast path |
+| Scope creep (voice+feedback+personalization) | Schedule | Phases 8–9 are explicitly stretch; core = Phases 0–7,10,11,12 |
+| Synthetic training queries low quality | Rubric #2 | Template + LLM paraphrase + manual review of a sample before training |
+
+---
+
+## 7. Suggested sequencing (core vs stretch)
+
+**Core (must-have for 100% on rubric):** Phases 0,1,2,3,4,5,6,7,10,11,12.
+**Stretch (creativity bonus):** Phases 8 (voice), 9 (feedback/personalization).
+**Parallelizable** (if team of 2–3): UI (P7) can develop against a mocked API while P4–P6 proceed; captioning (P2) is a long batch job that runs while you build the eval harness (P3).
+
+---
+
+## 8. Compute & cost strategy (local-first)
+
+**Hardware:** Apple M3, 16 GB unified memory, arm64, ~30 GB free disk.
+
+**Core insight:** of the 13 phases, exactly **one** (Phase 11, AWS g4dn deployment) needs paid compute — and only because the rubric names g4dn + wants P95/P99 on the target box. Everything else, including fine-tuning and captioning, runs on the M3 or a **free** cloud GPU (Kaggle / Colab). The loop is **local-first, two short free-GPU bursts, one short paid AWS window at the end.**
+
+### Where each phase runs
+
+| Phase | Where | Free? | Notes |
+|-------|-------|:----:|-------|
+| 0 Scaffold | Local | ✅ | CPU only |
+| 1 EDA/Preprocess | Local | ✅ | Listings ~83 MB, pandas/CPU; keep 3 GB image tar OFF the Mac |
+| 2 Captioning (BLIP-2, 40K) | Kaggle (Colab backup) | ✅ | One heavy batch; free T4 ≈ 2–6 h; dev on ~200-img local MPS sample |
+| 3 Baseline + eval | Local | ✅ | bge/MiniLM/e5 encode 40K in minutes on MPS; Chroma local |
+| 4 LoRA fine-tune | Kaggle/Colab | ✅ | Short — bge-base + LoRA ≈ 20–60 min on free T4 |
+| 5 Agent + memory | Local | ✅ | Ollama native on M3 (Metal); Qwen2.5-7B Q4 ≈ 4.7 GB; Redis via Docker |
+| 6 FastAPI | Local | ✅ | — |
+| 7 Streamlit UI | Local | ✅ | — |
+| 8 Voice | Local | ✅ | faster-whisper (CPU) + Piper run on M3 |
+| 9 Feedback/personalization | Local | ✅ | — |
+| 10 E2E + latency | Local (dev) → AWS (official) | mostly ✅ | Dev harness local; official P95/P99 captured in AWS window |
+| 11 Docker + AWS deploy | AWS g4dn.xlarge | 💵 only paid item | ~$0.526/hr on-demand, ~$0.16/hr spot; ~4–8 h → ~$2–4 (on-demand) / <$1.50 (spot). AWS free tier has NO GPU |
+| 12 Docs + video | Local | ✅ | Demo video can be recorded off the full stack running locally |
+
+### Free-GPU quotas (don't get surprised)
+- **Kaggle** (preferred): 30 GPU-hrs/week, P100 16 GB or 2×T4, ~12 h sessions, stable. Use for captioning + fine-tuning. ABO may already exist as a Kaggle dataset (no upload).
+- **Colab free**: T4 when available, dynamic quota, aggressive idle disconnects — backup only.
+- **HF Spaces free**: CPU-only (trimmed demo per §2.7; GPU Spaces are paid).
+
+### M3-specific watch-outs
+1. **Disk (30 GB free = tightest constraint):** do NOT unpack the 3 GB ABO image tar locally — caption in the cloud, pull back only the captions parquet (few MB). Local footprint stays ~8–10 GB (Ollama 7B ~5 GB + embed models ~1.5 GB + whisper ~0.5 GB + chroma ~0.3 GB).
+2. **16 GB unified memory running the FULL stack at once** (Ollama 7B + FastAPI + Streamlit + Chroma + Whisper) is tight. Mitigation: use **Qwen2.5-3B** for local dev iteration, run 7B only when demoing, close heavy apps. Real P95/P99 lives on g4dn, so local memory pressure never affects rubric numbers.
+
+### Initial-testing model
+Every phase's **exit-gate tests run locally as `pytest`** against a **dev subsample (~2–5K products)** for instant, free iteration. Only two gates are verified inside a cloud notebook (captioning quality, fine-tune-beats-baseline); their artifacts (captions parquet, LoRA weights) are pulled back to the Mac. Fold Phase 10's official latency run into the single AWS window to minimize paid hours.
+
+**Net cost to a fully-Excellent submission: ~$2–4** (one short g4dn window) — or **$0** with AWS/GCP credits or a GPU-HF-Spaces demo.
+
+---
+
+*End of plan. Awaiting review. No code will be written until you approve a phase.*

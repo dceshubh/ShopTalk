@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv-shoptalk/
+.venv/
+
+# Data & model artifacts (never commit — large, reproducible from pipeline)
+data/
+weights/
+*.parquet
+*.tar
+*.tar.gz
+chroma_db/
+
+# Secrets
+.env
+*.key
+
+# IDE / OS
+.vscode/
+.DS_Store
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+.claude/
