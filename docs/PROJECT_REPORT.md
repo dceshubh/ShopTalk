@@ -237,7 +237,9 @@ all 52 tests green.
 
 ## 3. Baseline retrieval (embeddings + vector DB + eval harness)
 
-**Status: in progress.**
+**Status: complete at dev-scale.** Full-catalog re-run is deferred until the full-corpus
+BLIP-2 captioning batch lands (§3.4 explains the scoping decision and why nothing about the
+pipeline changes when that happens).
 
 ### 3.1 Encoder comparison plan
 
@@ -290,17 +292,159 @@ gets *its own* prefix on *its own* side — the detail most likely to be silentl
 
 ### 3.3 Vector index + eval harness
 
-*Pending — not yet started.* Plan: ChromaDB collection per (encoder, corpus) cell with
-product-metadata storage (`product_type`, `color`, `material`, `brand`) for structured
-pre-filtering ("blue chair" → filter `color == blue` ∧ `product_type == CHAIR`, then ANN
-within that subset — the hard correctness exit-gate is "a blue-chair query never returns a
-red item"). A hand-written ~50-100-case golden query→relevant-product_id set
-(`data/eval/golden_set.json`) drives Precision@K / MRR as primary metrics (Recall@K/NDCG
-reported as approximate — a sampled golden set can't exhaustively label 40K products).
+**`src/index/build.py`** — one ChromaDB `PersistentClient` collection per (encoder,
+corpus_type) cell, named `{short_model_name}__{text_only|caption_enriched}` (e.g.
+`bge-base-en-v1-5__caption_enriched`). Design points:
+
+- **Doc-text rebuilding per corpus type**: `caption_enriched` calls the same
+  `build_doc_text()` from §2.6 with `visual_caption` populated; `text_only` calls it with
+  `visual_caption=None`. Same builder, same field order — the *only* variable between the two
+  corpora is whether the BLIP-2 caption segment is present, which is what makes the
+  text-only-vs-caption-enriched comparison a clean ablation rather than a confound.
+- **Structured-metadata storage + pre-filtering**: `product_type`, `color`, `material`,
+  `brand` are stored as Chroma collection metadata (after dropping `None` values — Chroma
+  rejects non-`str`/`int`/`float`/`bool` metadata outright, and ABO listings frequently lack
+  `brand`/`material`). This is what makes "SQL-then-semantic" possible: a query like "a blue
+  chair" can be translated to `where={"$and": [{"color": "Blue"}, {"product_type": "CHAIR"}]}`,
+  which Chroma applies as a metadata pre-filter *before* the ANN search runs — the mechanism
+  behind the hard correctness exit-gate "a blue-chair query never returns a red item" (verified
+  empirically in §3.4).
+- **`hnsw:space: "cosine"`** on every collection, matching the `normalize_embeddings=True`
+  convention from `Encoder` (§3.2) — cosine similarity reduces to inner product on normalized
+  vectors, so the index's distance metric and the encoder's training objective stay aligned.
+- **Replace-on-rebuild**: `build_collection()` deletes any existing collection of the same
+  name before creating a fresh one — re-running the sweep is idempotent, not additive.
+- Unit-tested in `tests/test_index.py` (8 tests, Chroma client/collection faked) — covers
+  doc-text rebuilding per corpus type, `None`-metadata sanitization, collection-name
+  normalization, replace-on-rebuild, batched `encode_passages` calls, and that `search()`
+  embeds the *query* side (not passage side) and forwards `where` untouched.
+
+**`data/eval/golden_set.json`** — 55 hand-written `(query → relevant_item_ids)` cases, split
+into three categories:
+
+| Category | Count | Tests |
+|---|---|---|
+| `easy` | 23 | Query phrasing closely mirrors the product name/type — baseline lexical+semantic recall |
+| `attribute` | 22 | Query names a specific color/material/type combo where the corpus has multiple same-type items in *different* colors/materials — the structured-pre-filter correctness cases |
+| `hard` | 10 | Naturalistic shopper phrasing requiring inference, synonym matching, or multiple plausible matches — tests whether semantic similarity (and the visual caption) carries the query past a literal keyword match |
+
+Two design choices worth calling out:
+
+- **Eval-integrity**: written entirely by hand against real catalog listings — *not* generated
+  from any template — so it remains distribution-disjoint from whatever synthetic-query
+  template eventually drives the LoRA fine-tuning comparison (the condition
+  `docs/ShopTalk_Plan.md` §2.3 names for "fine-tuned beats pretrained" to mean anything rather
+  than be a circular artifact of training and testing on the same query distribution).
+- **Forward-compatible by construction**: drawn from the 200-doc BLIP-2 dev sample, itself a
+  uniform random subset of the full 39,733-product catalog — every `relevant_item_id` remains
+  valid once the full catalog is indexed, so the same 55 cases re-run unchanged at full scale
+  (Recall@K's "approximate" framing absorbs the fact that full-scale indexing may surface
+  additional valid matches outside the hand-picked list).
+- Several `hard` cases deliberately target attributes that exist *only* in the visual caption
+  (e.g. `color: None` in the catalog metadata, but the caption says "light blue leather") —
+  direct empirical tests of whether caption-enrichment helps retrieval, not just a vibe.
+
+**`src/eval/harness.py`** — the metric + orchestration layer:
+
+- `precision_at_k`, `reciprocal_rank` (MRR), `recall_at_k`, `ndcg_at_k` (binary-relevance,
+  `1/log2(rank+1)` discounting) — pure functions over a ranked-id-list + relevance-set, unit
+  tested against synthetic ranked lists (no model/index involved).
+- Per `configs/config.yaml`: **Precision@K and MRR are primary**; Recall@K and NDCG are
+  reported as *approximate* — a 55-case sampled set can't give exhaustive or graded relevance
+  labels across a 40K-product catalog.
+- `evaluate()` retrieves `top_k = max(k_values)` **once per query** and slices the same ranked
+  list for every smaller `k` — one ANN search per query, not one per `(query, k)` pair (with
+  `k_values = [1, 3, 5, 10]` and 55 queries × 6 collections, that's the difference between 330
+  and 1,320 searches).
+- `assert_filter_excludes_mismatches()` — runs a query *with* the structured `where` filter
+  applied and asserts every returned item's metadata satisfies it; raises on the first
+  mismatch (a correctness gate, not a soft metric). This is the actual exit-gate check, run
+  against real `attribute`-category golden cases in §3.4.
+- Unit-tested in `tests/test_harness.py` (15 tests; retrieval faked via `search` patching).
+
+### 3.4 Dev-scale comparison sweep — results
+
+**Scoping decision: dev-scale now, full-scale later.** Only 200 of the catalog's 39,733
+products have BLIP-2 captions so far (the dev-comparison sample from §2); captioning the full
+catalog is a separate multi-hour Kaggle/Colab GPU batch job, deferred to its own run. Rather
+than block the entire baseline-retrieval phase on that job, we built and validated the
+**complete** pipeline — index, golden set, harness, comparison sweep — against the 200-doc
+dev sample, explicitly as a documented dev-scale proof. `run_comparison_sweep()` defaults to
+the dev parquet; pointing it at the full-catalog enriched parquet once that batch lands
+re-runs the *exact same* harness/sweep at full scale — nothing else changes.
+
+**The sweep**: 3 encoders × 2 corpora = 6 Chroma collections (200 docs each, ~2s/collection
+to embed+index on M3/MPS), each evaluated against all 55 golden queries (`k_values = [1, 3,
+5, 10]`):
+
+| Model | Corpus | MRR | P@1 | P@3 | P@5 | P@10 | Recall@5 | NDCG@5 |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| `BAAI/bge-base-en-v1.5` | text_only | 0.936 | 0.891 | 0.358 | 0.215 | 0.109 | 0.991 | 0.947 |
+| `BAAI/bge-base-en-v1.5` | **caption_enriched** | **0.991** | **0.982** | 0.364 | 0.218 | 0.109 | 1.000 | **0.993** |
+| `sentence-transformers/all-MiniLM-L6-v2` | text_only | 0.905 | 0.836 | 0.339 | 0.215 | 0.107 | 0.991 | 0.920 |
+| `sentence-transformers/all-MiniLM-L6-v2` | caption_enriched | 0.923 | 0.873 | 0.358 | 0.218 | 0.109 | 1.000 | 0.942 |
+| `intfloat/e5-base-v2` | text_only | 0.927 | 0.873 | 0.345 | 0.215 | 0.109 | 0.982 | 0.936 |
+| `intfloat/e5-base-v2` | caption_enriched | 0.988 | 0.982 | 0.364 | 0.218 | 0.109 | 1.000 | 0.991 |
+
+**Exit-gate #1 — "does caption-enrichment help retrieval, with numbers, not vibes":
+unambiguously yes, for all three encoders:**
+
+| Model | MRR text_only → caption_enriched | Lift |
+|---|---|---|
+| `bge-base-en-v1.5` | 0.936 → 0.991 | **+5.9%** |
+| `e5-base-v2` | 0.927 → 0.988 | **+6.6%** |
+| `all-MiniLM-L6-v2` | 0.905 → 0.923 | +1.9% |
+
+The `hard`-category cases that target caption-only attributes (e.g. "light blue gladiator
+sandals" where the catalog's `color` field is `None` and only the BLIP-2 caption says "light
+blue leather") are exactly where this lift comes from — visual-caption enrichment recovers
+signal that the structured catalog metadata simply doesn't carry.
+
+**Exit-gate #2 — "a 'blue chair' query never returns a red item or a non-chair in top-K":**
+ran `assert_filter_excludes_mismatches()` against the chosen collection
+(`bge-base-en-v1-5__caption_enriched`) for all 22 `attribute`-category golden cases, building
+each `where = {"$and": [{"color": <actual>}, {"product_type": <actual>}]}` from the known
+relevant item's real metadata (21 checked, 1 skipped for missing `color`/`product_type`
+metadata — itself an honest signal that not every ABO listing carries both fields):
+
+```
+  OK  [      Grey / RUG         ] 'a grey area rug for the living room'
+  OK  [Aegean Blue / RUG         ] 'a blue striped jute rug'
+  OK  [     Brown / CHAIR       ] 'a brown leather recliner chair'
+  OK  [     Green / CHAIR       ] 'a green velvet accent chair'
+  ... (17 more)
+21 checked, 1 skipped (missing color/product_type metadata) — 0 violations
+```
+
+**Zero violations across all 21 checked cases** — the structured pre-filter is doing real
+filtering (excluding mismatches before the ANN search runs), not just nudging rank order.
+
+**Encoder choice: `BAAI/bge-base-en-v1.5`, on the `caption_enriched` corpus** — highest MRR
+(0.991) and NDCG@5 (0.993) of the six cells, edges out `e5-base-v2` (0.988 / 0.991, its
+closest competitor) by a small but consistent margin across every metric, and is the model
+`load_encoder()` defaults to (`models.text_encoder.primary` in `config.yaml`). `all-MiniLM-
+L6-v2` trails both larger asymmetric-retrieval encoders on every metric, consistent with the
+truncation analysis in §2.6 (it truncates 10.9% of `doc_text` vs. ~0.45% for bge/e5) — the
+extra cost of the 768-dim models is justified on this catalog.
+
+A caveat worth being explicit about: at n=200 / 55 queries, several cells differ by margins
+the eval can't fully resolve (e.g. bge-base 0.991 vs. e5-base 0.988 MRR is ~1 query's worth of
+difference). The full-catalog re-run (§3.4 scoping note) will be the authoritative comparison;
+this dev-scale run's job is to prove the *pipeline* is correct and to make a provisional,
+numbers-backed pick to build the MVP against — not to be the final word on encoder choice.
+
+**Artifacts**: `src/index/build.py`, `src/eval/harness.py`, `data/eval/golden_set.json`,
+`tests/test_index.py` (8 tests), `tests/test_harness.py` (15 tests), 6 Chroma collections
+under `data/chroma/`.
 
 ## 4. Fine-tuning (LoRA on the retrieval encoder)
 
-*Pending — not yet started.*
+*Pending — not yet started. Per the sequencing note in `docs/ShopTalk_Plan.md` §7, this stage
+now runs **after** the app reaches MVP state (agent + API + UI working locally/Colab on the
+pretrained `bge-base-en-v1.5` baseline from §3), not immediately after baseline retrieval —
+the retrieval encoder is swappable (`load_encoder(model_name)` over a shared `doc_text`
+corpus), so the fine-tuned encoder slots in as a drop-in upgrade once the rest of the stack
+is proven.*
 
 ## 5. Agent + memory layer
 

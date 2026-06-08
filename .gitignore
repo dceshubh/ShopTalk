@@ -9,8 +9,14 @@ __pycache__/
 .venv-shoptalk/
 .venv/
 
-# Data & model artifacts (never commit — large, reproducible from pipeline)
-data/
+# Data & model artifacts (never commit — large, reproducible from pipeline).
+# data/eval/ is intentionally NOT listed here — it holds hand-written eval source content
+# (golden_set.json), small and not reproducible from any pipeline step.
+data/chroma/
+data/images/
+data/kaggle_process/
+data/processed/
+data/raw/
 weights/
 *.parquet
 *.tar
