@@ -20,6 +20,7 @@ from transformers import (
     BlipProcessor,
 )
 
+from src.common.device import resolve_device
 from src.common.logging import get_logger
 
 logger = get_logger(__name__)
@@ -60,20 +61,6 @@ class Captioner:
             generated_ids = self.model.generate(**inputs, max_new_tokens=max_new_tokens)
         text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
         return text.strip()
-
-
-def resolve_device() -> str:
-    """Pick the best available device: CUDA (Kaggle/Colab T4) > MPS (Apple Silicon) > CPU.
-
-    Keeping this device-agnostic is what lets the *same* module run the local ~200-image
-    dev sample on an M3 and the full ~40K batch on a free cloud GPU — no fork in the code
-    between "dev" and "real" runs, only a different `sample_size` (see enrich.py).
-    """
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
 
 
 def load_captioner(model_name: str, *, device: str | None = None) -> Captioner:

@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
-from src.captioning.caption import Captioner, load_captioner, resolve_device
+from src.captioning.caption import Captioner, load_captioner
 from src.captioning.enrich import caption_products
 from src.captioning.images import ensure_images_cached, fetch_image
 
@@ -63,23 +63,6 @@ def test_ensure_images_cached_resolves_every_path_and_reuses_the_cache(tmp_path)
 # ---------------------------------------------------------------------------
 # caption.py — device resolution, registry, generation contract
 # ---------------------------------------------------------------------------
-
-
-def test_resolve_device_prefers_cuda_then_mps_then_cpu():
-    with patch("src.captioning.caption.torch.cuda.is_available", return_value=True):
-        assert resolve_device() == "cuda"
-
-    with (
-        patch("src.captioning.caption.torch.cuda.is_available", return_value=False),
-        patch("src.captioning.caption.torch.backends.mps.is_available", return_value=True),
-    ):
-        assert resolve_device() == "mps"
-
-    with (
-        patch("src.captioning.caption.torch.cuda.is_available", return_value=False),
-        patch("src.captioning.caption.torch.backends.mps.is_available", return_value=False),
-    ):
-        assert resolve_device() == "cpu"
 
 
 def test_load_captioner_rejects_unregistered_model_names():

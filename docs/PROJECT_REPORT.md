@@ -237,7 +237,66 @@ all 52 tests green.
 
 ## 3. Baseline retrieval (embeddings + vector DB + eval harness)
 
-*Pending — not yet started.*
+**Status: in progress.**
+
+### 3.1 Encoder comparison plan
+
+We compare three pretrained sentence encoders, each on **two** corpora — text-only `doc_text`
+and caption-enriched `doc_text` (the artifact from §2) — for a 3 × 2 = 6-cell sweep:
+
+| Model | Dim | Family / training objective | Query prefix | Passage prefix |
+|---|---|---|---|---|
+| `BAAI/bge-base-en-v1.5` | 768 | Asymmetric retrieval, contrastive (BAAI) | `"Represent this sentence for searching relevant passages: "` | `""` |
+| `intfloat/e5-base-v2` | 768 | Asymmetric retrieval, contrastive (weakly-supervised + fine-tune) | `"query: "` | `"passage: "` |
+| `sentence-transformers/all-MiniLM-L6-v2` | 384 | Symmetric, distilled general-purpose | *(none)* | *(none)* |
+
+**Why these three:** bge and e5 are both top-tier *asymmetric retrieval* encoders trained with
+explicit query/passage instruction-prefix conventions baked into their contrastive
+pretraining — using the right prefix is part of getting a fair number out of them, and is
+exactly the kind of subtle, get-it-wrong-and-you-silently-handicap-the-model detail worth
+demonstrating mastery of. MiniLM is the lightweight symmetric baseline (384-dim vs. 768,
+~4× smaller) — it tells us whether the larger asymmetric models' extra cost is worth it on
+this catalog.
+
+**Why not just compare random/larger models:** every encoder here truncates well below the
+catalog's longest `doc_text` (MiniLM 256 tokens, bge/e5 512) — so a longer-context model
+helps only if truncation is actually costing us recall. We measured this directly on the
+real 200-doc enriched sample (see §2.6): MiniLM truncates 10.9% of docs vs. bge/e5's 0.45% —
+MiniLM is the one model where context length is a live concern, which the eval (§3.3) will
+quantify rather than guess at.
+
+### 3.2 `src/embeddings/encode.py` — pluggable encoder
+
+Built `Encoder` (wraps `SentenceTransformer`) + `load_encoder(model_name)`, mirroring the
+`Captioner`/`load_captioner` pattern from §2.1 — one shared module for both offline indexing
+and online query-time embedding, so a query is always embedded with the *exact* model,
+prefix convention, and normalization it was indexed with:
+
+- `_PREFIX_CONVENTIONS` registry maps each model name to its `(query_prefix, passage_prefix)`
+  pair (confirmed against each model's HuggingFace README — see table above); loading an
+  unregistered model raises rather than silently encoding with no prefix.
+- `encode_queries()` / `encode_passages()` apply the correct side-specific prefix — kept as
+  two methods (not one `encode(text, side=...)`) so the offline indexer and the online
+  retrieval path can't accidentally swap sides.
+- `normalize_embeddings=True` always — makes cosine similarity == dot product, the standard
+  convention for retrieval embeddings (matches MTEB evaluation, simplifies vector-DB
+  distance-metric config to a single inner-product index).
+- Device resolution shared via `src.common.device.resolve_device` (refactored out of
+  `caption.py` in this stage — both captioning and embedding need "CUDA on Kaggle, MPS on
+  M3, CPU fallback" without forking code paths).
+
+Unit-tested in `tests/test_encode.py` (model loading faked; asserts each registered model
+gets *its own* prefix on *its own* side — the detail most likely to be silently wrong).
+
+### 3.3 Vector index + eval harness
+
+*Pending — not yet started.* Plan: ChromaDB collection per (encoder, corpus) cell with
+product-metadata storage (`product_type`, `color`, `material`, `brand`) for structured
+pre-filtering ("blue chair" → filter `color == blue` ∧ `product_type == CHAIR`, then ANN
+within that subset — the hard correctness exit-gate is "a blue-chair query never returns a
+red item"). A hand-written ~50-100-case golden query→relevant-product_id set
+(`data/eval/golden_set.json`) drives Precision@K / MRR as primary metrics (Recall@K/NDCG
+reported as approximate — a sampled golden set can't exhaustively label 40K products).
 
 ## 4. Fine-tuning (LoRA on the retrieval encoder)
 
@@ -261,6 +320,7 @@ all 52 tests green.
 
 ---
 
-*Last updated: 2026-06-07 — captioning-stage comparison results added (§2); 50-caption manual
-review scored via vision LLM-as-judge and folded into §2.4/§2.5; `build_doc_text` truncation
-fix documented in §2.6 (caption reordered ahead of bullet_points/keywords).*
+*Last updated: 2026-06-07 — baseline-retrieval stage started (§3): encoder comparison plan
+(bge-base / e5-base / MiniLM-L6, text-only vs. caption-enriched) and `src/embeddings/encode.py`
+(pluggable encoder with per-model query/passage prefix handling) documented in §3.1/§3.2;
+ChromaDB index + golden-eval-set harness still pending (§3.3).*
