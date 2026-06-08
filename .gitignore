@@ -13,6 +13,7 @@ __pycache__/
 # data/eval/ is intentionally NOT listed here — it holds hand-written eval source content
 # (golden_set.json), small and not reproducible from any pipeline step.
 data/chroma/
+data/feedback/
 data/images/
 data/kaggle_process/
 data/processed/

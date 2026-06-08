@@ -26,10 +26,40 @@ English-language listings, deduplicated and structured into a canonical `product
   `images.csv` for `image_path`.
 - **Tests:** `tests/test_data_pipeline.py`, `tests/test_preprocess.py` — passing.
 - **Notebook:** `notebooks/01_eda.ipynb` — distribution of `product_type`/`domain_name`,
-  missing-field rates, `doc_text` length distribution, sample listings before/after cleaning.
+  language mix, image-resolvability, `doc_text` length distribution, sample listings
+  before/after cleaning.
 
-*(Headline EDA numbers — null rates per field, top product types, doc_text length percentiles —
-to be pasted in here from `01_eda.ipynb` once finalized; the pipeline and tests are green.)*
+### 1.1 Headline EDA findings
+
+- **Multilingual catalog — the language filter is load-bearing, not boilerplate.** Of
+  147,702 raw listings, only 122,734 (83.1%) carry *any* English-tagged `item_name`, and
+  18.9% carry *multiple* `item_name` languages on the same record (`en_IN` alone accounts for
+  51.8% of English-tagged listings, ahead of `en_US` at 17.9%). Indexing without the `en_*`
+  filter would silently pollute the embedding space with German/Chinese/Korean/Hebrew text —
+  this is exactly the kind of "non-obvious dataset fact that becomes EDA depth" the plan
+  flagged (`docs/ShopTalk_Plan.md` §2.1).
+- **The catalog skews electronics-accessories and apparel, not furniture — confirming the
+  plan's pre-registered "verify the catalog mix" gate.** Before filtering,
+  `CELLULAR_PHONE_CASE` alone is 43.9% of the full catalog; after the English filter it's
+  still 52.8% of the remaining listings, with `SHOES` (8.1%), `GROCERY` (5.1%), and `HOME`
+  (2.2%) trailing far behind. The **stratified 39,733-row subsample deliberately rebalances**
+  this — capping dominant categories so `SHOES`/`CELLULAR_PHONE_CASE`/`GROCERY` each land
+  near 7.6% and long-tail categories like `CHAIR` (3.25%), `SOFA` (1.89%), and `RUG` (1.55%)
+  get meaningful representation. This directly shaped the demo-query and golden-set themes
+  (furniture/home-goods, not the raw catalog's phone-case-dominated reality).
+- **No price field** — confirmed absent from the ABO listings schema, exactly as the plan's
+  pre-registered risk flagged (§2.1, "ABO is a catalog/3D-asset dataset; it very likely has no
+  price attribute"). Decision: dropped the price filter rather than synthesizing fake prices —
+  structured filtering instead targets `color`/`material`/`product_type`/`brand`, all of which
+  are real, dense fields.
+- **Image join is clean: 100% resolvable.** All 39,733 sampled products have a
+  `main_image_id` that resolves to a real file via the 398,212-row `images.csv` join table —
+  no dropped rows, no fallback path needed for this stage.
+- **`doc_text` length is right-skewed** (mean 631 chars, median 646, P75 853, max 11,012) —
+  the long tail is why caption placement matters: `build_doc_text` puts the BLIP-2 caption
+  *ahead of* the bulkier `bullet_points`/`keywords` blocks (§2.6) so encoders that truncate
+  from the tail don't lose the visual signal on the longest listings.
+- **Zero duplicate `item_id`s** in the final sample — the dedup step is verified, not assumed.
 
 ---
 
@@ -448,8 +478,8 @@ is proven.*
 
 ## 5. Agent + memory layer
 
-**Status:** complete (unit/integration-tested with mocked LLM + real local Redis; live
-multi-turn verification against the real Groq API pending `GROQ_API_KEY`).
+**Status:** complete — unit/integration-tested with mocked LLM + real local Redis, and
+live-verified end-to-end against the real Groq API (§5.6).
 
 ### 5.1 Generator-LLM pivot — Groq-hosted, not local Ollama
 
@@ -459,7 +489,7 @@ a 7B model locally alongside FastAPI + Streamlit + Chroma + faster-whisper would
 M3-specific watch-out). Pivoted to **Groq's free-tier hosted inference** instead:
 
 - $0 cost, OpenAI-compatible `chat.completions` API, zero local RAM footprint — the generator
-  LLM is orthogonal to the Phase 3 retrieval evals (it never touches embeddings or ranking),
+  LLM is orthogonal to this report's retrieval evals (§3 — it never touches embeddings or ranking),
   so the pivot doesn't disturb any already-measured number.
 - Verified Groq's *actual* hosted-model catalog via a live fetch before writing any model name
   into code (per the "don't fabricate APIs — mark inferred" convention): chose
@@ -524,7 +554,7 @@ the extracted attributes can't disagree about what the shopper is asking for).
 shape `src.index.build.search` expects: `None` when nothing was extracted, a bare
 `{"column": "value"}` for a single attribute, or `{"$and": [...]}` (in fixed
 `METADATA_COLUMNS` order) for multiple — mirroring the "SQL-then-semantic" pre-filter pattern
-already proven in the Phase 3 structured-filter check (21/22 cases, 0 violations). 10 tests in
+already proven in the structured-filter check in §3.4 (21/22 cases, 0 violations). 10 tests in
 `tests/test_filters.py`, including a parametrized sweep over all four metadata columns and an
 explicit check that `rewritten_query` (search *text*) never leaks into the metadata `where`
 clause.
@@ -579,7 +609,7 @@ connection.
 ### 5.6 Test summary — including live Groq integration runs
 
 35 new tests across `tests/test_{llm,memory,filters,graph}.py`, all passing; full suite
-(116 tests) green with no regressions to the Phase 3 retrieval-eval tests.
+(116 tests) green with no regressions to the retrieval-eval tests in §3.
 
 With `GROQ_API_KEY` configured, both remaining live-integration exit gates were run against
 the **real** Groq API + the real `bge-base-en-v1.5`/`caption_enriched` index + real Redis:
@@ -601,7 +631,8 @@ the **real** Groq API + the real `bge-base-en-v1.5`/`caption_enriched` index + r
 
 ## 6. API, UI, voice
 
-**Status:** API complete and live-verified end-to-end (`src/api/`); UI and voice pending.
+**Status:** API and UI complete and live-verified end-to-end (`src/api/`, `src/ui/`); voice
+pipeline pending.
 
 ### 6.1 `src/api/main.py` — FastAPI inference service, models loaded ONCE at startup
 
@@ -710,14 +741,76 @@ has), not an API defect.
 
 10 tests in `tests/test_api.py`, all passing — `/health` load-once proof, `/chat` schema +
 grounded product cards + structured-422 validation, `/products/{id}` success + structured-404,
-the live transformer-parity check, and the 10-way concurrency test. Full suite green at 126
-tests with no regressions.
+the live transformer-parity check, and the 10-way concurrency test.
 
-### 6.8 Pending — UI and voice
+### 6.8 `src/ui/app.py` + `src/ui/feedback.py` — Streamlit chat UI
 
-Streamlit UI (chat + voice + product cards + filters + 👍/👎) and the voice pipeline
-(faster-whisper STT / Piper TTS) are not yet started — tracked as their own phases in
-`docs/ShopTalk_Plan.md` (Phase 7, Phase 8).
+A `streamlit` chat front-end that talks to the FastAPI backend over HTTP — never
+in-process — so the deployment surface stays exactly what the rubric describes (UI → REST
+API → models loaded once), and so the UI can be developed and demoed against either a local
+or a remote instance of the same service by changing one config value (`ui.api_base_url`).
+
+- **Identity without a login flow:** the sidebar's `user_id` is a stable, user-editable text
+  field (defaults to a random `user-xxxxxxxx`) that keys the existing Redis-backed
+  `PersistentMemory` (§5.3) — typing the same id on a later visit recalls the same
+  preferences. This was a deliberate scope call made mid-build: real authentication
+  (password hashing, sessions, tokens) is security-sensitive and orthogonal to what the
+  rubric actually asks for ("conversational history" + "personalization"), both of which a
+  lightweight stable identity already demonstrates end-to-end.
+- **Conversation history**: `st.session_state.messages` accumulates every turn and
+  re-renders the full transcript via `st.chat_message` on each rerun — the rubric's
+  "working UI with conversational history" bar.
+- **Sidebar filters fold into one pipeline, not two:** `product_type`/`color`/`material`
+  selections are appended to the outgoing message text (`_apply_sidebar_filters`) rather than
+  routed through a separate filter API — they're picked up by the *same* `extract_filters`
+  LLM call (§5.4) that powers conversational filtering, so there's exactly one place attribute
+  extraction can go wrong, not two that can silently disagree.
+- **Product cards** show the image (via the API's `/images` mount), name, attributes
+  (`product_type`/`color`/`material`/`brand`), a link to `/products/{id}`, and the raw
+  `item_id` — satisfying the rubric's "product identifier displayed."
+- **👍/👎 feedback** is wired to a new `FeedbackStore` (`src/ui/feedback.py`) — SQLite,
+  schema `(user_id, session_id, query, item_id, verdict, ts)` with a
+  `UNIQUE (user_id, query, item_id)` constraint and an `INSERT ... ON CONFLICT ... DO UPDATE`
+  upsert, so re-clicking the opposite verdict overwrites rather than accumulating rows. This
+  keeps "the latest verdict for this product on this query" unambiguous — exactly the shape
+  a future hard-negative-mining pass over `verdict='down'` rows would need.
+
+**A real bug two layers of testing caught before a human would have:**
+Each assistant turn carries a `turn_id` (a short uuid generated once and stored alongside the
+turn in `st.session_state.messages`), used as the feedback-button key prefix on every rerun.
+An earlier draft keyed buttons by list position — `live-{n}` while rendering the turn that
+just arrived, `hist-{n}` when replaying it from history on the next rerun. Two different keys
+for the same logical card meant Streamlit could never associate a click made on the "live"
+card with the "history" card it became the instant the script reran — the click was silently
+dropped. `tests/test_ui_app.py::test_thumbs_up_persists_a_verdict_to_the_real_feedback_store`
+caught this (the asserted row was simply never written); switching to a stable `turn_id`
+fixed it. Separately, a live run against the real API surfaced
+`TypeError: ImageMixin.image() got an unexpected keyword argument 'use_container_width'` —
+that kwarg doesn't exist in the pinned `streamlit==1.39.0` (it's `use_column_width` here); the
+unit tests' fixtures used `image_path=None` and never reached the `st.image` line, so only an
+actual round trip against a real product card caught it. Both are now fixed and covered.
+
+**Testing approach** (the project's "fake the expensive edge, prove the wiring" convention,
+applied to a UI for the first time): driven via `streamlit.testing.v1.AppTest`, which re-execs
+`app.py` as a fresh script on every `.run()` — so a patch on an already-imported
+`src.ui.app` never reaches the running script. The one expensive edge (the `/chat` HTTP call)
+is faked at the shared `httpx.post` module boundary, which *does* survive the re-exec;
+everything else — sidebar wiring, session state, message rendering, real `FeedbackStore`
+writes against a real temp-file SQLite database, and the unreachable-backend error path —
+runs for real. 8 tests in `tests/test_ui_app.py`, plus 7 in `tests/test_feedback.py` for the
+store itself (real SQLite, no mocking the one thing being tested).
+
+**Live end-to-end verification:** booted the real API (`uvicorn`, real Groq + real
+`bge-base-en-v1.5` index + real Redis + real catalog) and drove the real Streamlit app against
+it through `AppTest` (no mocks at all this time): typed "show me a brown leather chair," got
+back a grounded response citing `B07HZ1RYNT` ("...Stone & Beam Fischer Sleeper Chair..."), a
+rendered card with the real name/attributes/link, and working, stably-keyed 👍/👎 buttons —
+all in one turn, no instructions needed. (The card's image itself 404s — same known dev-scale
+gap as §6.6: this product's photo lives only in the full ABO archive, never pulled locally.)
+
+### 6.9 Pending — voice
+
+The voice pipeline (`faster-whisper` STT / Piper TTS) is not yet started.
 
 ## 7. End-to-end testing & latency (P95/P99)
 
@@ -729,7 +822,7 @@ Streamlit UI (chat + voice + product cards + filters + 👍/👎) and the voice 
 
 ---
 
-*Last updated: 2026-06-07 — baseline-retrieval stage started (§3): encoder comparison plan
-(bge-base / e5-base / MiniLM-L6, text-only vs. caption-enriched) and `src/embeddings/encode.py`
-(pluggable encoder with per-model query/passage prefix handling) documented in §3.1/§3.2;
-ChromaDB index + golden-eval-set harness still pending (§3.3).*
+*Last updated: 2026-06-08 — Streamlit UI + feedback store complete and live-verified
+end-to-end (§6.8); full suite green at 141 tests with no regressions. Remaining: fine-tuning
+(§4), voice (§6.9), E2E latency (§7), and deployment (§8) — see `docs/ShopTalk_Plan.md` §7
+for the current build order.*

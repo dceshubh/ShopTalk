@@ -10,6 +10,7 @@ paths:
   products_enriched_parquet: "data/processed/products_enriched.parquet"
   golden_set: "data/eval/golden_set.json"
   chroma_dir: "data/chroma"
+  feedback_db: "data/feedback/feedback.sqlite"
   weights_dir: "weights"
 
 dataset:
@@ -90,6 +91,10 @@ agent:
 api:
   host: "0.0.0.0"
   port: 8000
+
+ui:
+  api_base_url: "http://localhost:8000"
+  title: "ShopTalk"
 
 logging:
   level: "INFO"

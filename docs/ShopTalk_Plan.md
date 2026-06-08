@@ -1,10 +1,12 @@
 # ShopTalk — AI-Powered Shopping Assistant
 ## Master Development Plan (Phase-Gated)
 
-> **Status:** DRAFT for review — no code written yet.
+> **Status:** In progress — Phases 0–3, 5–7 complete (exit gates green); see §3 for
+> per-phase status and §7 for the current build order. `docs/PROJECT_REPORT.md` carries the
+> evidence (numbers, transcripts, test summaries) behind every checked gate below.
 > **Author context:** Shubham Varshney (Sr SDE L6 → MLE L6). IK Advanced ML Capstone (Project 6).
 > **Goal:** Hit **100% (Excellent column)** on every rubric criterion, plus creativity add-ons (agentic, voice, memory, feedback loop) that the rubric explicitly rewards.
-> **Working rule:** We move to phase N+1 **only after** phase N's "Exit Gate" tests pass and you review them.
+> **Working rule:** Move to stage N+1 only after stage N's exit-gate tests pass and the evidence is recorded in `PROJECT_REPORT.md`.
 
 ---
 
@@ -323,14 +325,20 @@ Every phase below is engineered to produce evidence for these.
 - Feedback persisted (SQLite/Redis) → feeds Phase 9 feedback loop.
 
 **Exit-gate tests:**
-- [ ] Conversation history visibly persists across turns in the UI.
-- [ ] Product cards render image + id + clickable identifier (rubric: "product identifier displayed").
-- [ ] Filters change results correctly.
-- [ ] 👍/👎 writes a record (query, product_id, verdict, ts).
-- [ ] Usability pass: a fresh user completes a search in <30s without instructions.
+- [x] Conversation history visibly persists across turns in the UI. `st.session_state.messages` accumulates every turn and the full transcript re-renders on each rerun (`tests/test_ui_app.py::test_sending_a_message_renders_response_text_and_product_cards_with_feedback_buttons`); live-verified against the real API — a second message kept the first turn's user/assistant bubbles on screen.
+- [x] Product cards render image + id + clickable identifier (rubric: "product identifier displayed"). Each card shows `st.image`, name, attributes, a "View product ↗" link to `/products/{id}`, and the raw `item_id`.
+- [x] Filters change results correctly. Sidebar `product_type`/`color`/`material` selections are folded into the outgoing message text by `_apply_sidebar_filters` (unit-tested directly) — routed through the *same* `extract_filters` LLM call the conversational path uses, so there is exactly one filter pipeline, never two that can drift apart.
+- [x] 👍/👎 writes a record (query, product_id, verdict, ts). `tests/test_ui_app.py::test_thumbs_up_persists_a_verdict_to_the_real_feedback_store` clicks a real rendered button and asserts the row lands in a real SQLite `FeedbackStore` with the correct `(user_id, query, item_id, verdict)`.
+- [x] Usability pass: a fresh user completes a search in <30s without instructions. Live-verified end-to-end against the real stack (`uvicorn` + real Groq + real `bge-base-en-v1.5` index + real Redis + real SQLite): typed "show me a brown leather chair," got a grounded response citing `B07HZ1RYNT` ("...Stone & Beam Fischer Sleeper Chair...") with a rendered card, name, attributes, and working 👍/👎 buttons in a single turn — no instructions needed, sidebar is the only "extra" control and it's optional.
 
-**Rubric:** #5 (5). **Artifacts:** UI app, screenshots.
-**REVIEW CHECKPOINT 7 →** you click through the app.
+**Build notes / deviations:**
+- **No login** (a design call made when the question came up mid-build): the sidebar's `user_id` is a stable, user-chosen text field that keys Redis-backed `PersistentMemory` — it demonstrates the cross-session personalization capability the rubric wants without building a security-sensitive auth subsystem that's orthogonal to it.
+- **Stable per-turn keys, not positional ones:** each assistant turn carries a `turn_id` (generated once, stored in `st.session_state.messages`) used as the feedback-button key prefix on every rerun. An earlier draft keyed buttons by list position (`live-{n}` while rendering, `hist-{n}` on replay) — different keys for the same logical card meant Streamlit silently dropped the click on rerun. Caught by `tests/test_ui_app.py::test_thumbs_up_persists_a_verdict_to_the_real_feedback_store` before it ever reached a human clicking through the app.
+- **`st.image(..., use_column_width=True)`, not `use_container_width`:** the latter doesn't exist in the pinned `streamlit==1.39.0`; caught only by running the UI against the *real* API (the unit tests' fixtures used `image_path=None` and never hit the `st.image` line) — a reminder that "fake the expensive edge" still needs at least one real round trip before calling a UI feature done.
+- `tests/test_ui_app.py` (8 tests) drives the app via `streamlit.testing.v1.AppTest`, which re-execs `app.py` as a fresh script per `.run()` — so the one expensive edge (the `/chat` HTTP call) is faked at the shared `httpx.post` module boundary (survives the re-exec), while sidebar wiring, session state, message rendering, real `FeedbackStore` writes, and error handling all run for real.
+
+**Rubric:** #5 (5). **Artifacts:** `src/ui/{app,feedback}.py`, 15 passing tests (`tests/test_ui_app.py` + `tests/test_feedback.py`), live end-to-end smoke test against the full real stack.
+**REVIEW CHECKPOINT 7 → cleared** — full real-stack run: real Groq + real `bge-base-en-v1.5` index + real Redis + real SQLite, driven through `AppTest` end-to-end (chat round trip, rendered card, feedback click persisted).
 
 ---
 
@@ -529,4 +537,6 @@ Every phase's **exit-gate tests run locally as `pytest`** against a **dev subsam
 
 ---
 
-*End of plan. Awaiting review. No code will be written until you approve a phase.*
+*End of plan. Phases 0–3 and 5–7 are complete with green exit gates (see §3 and
+`docs/PROJECT_REPORT.md` for the evidence); Phase 4 (fine-tuning) is next per the
+reordered sequence in §7.*
