@@ -153,9 +153,9 @@ def test_caption_products_appends_visual_segment_via_shared_build_doc_text(tmp_p
 
     row = enriched.iloc[0]
     assert row["visual_caption"] == "a marble-pattern phone case"
-    # `build_doc_text` (the same function the offline indexer / online API call) appends
-    # the visual segment last — confirmed in tests/test_preprocess.py.
-    assert row["doc_text"].endswith("visual: a marble-pattern phone case")
+    # `build_doc_text` (the same function the offline indexer / online API call) places
+    # the visual segment right after the core attributes — confirmed in tests/test_preprocess.py.
+    assert "visual: a marble-pattern phone case" in row["doc_text"]
     assert "Mid-Century Walnut Chair" in row["doc_text"]
 
 
@@ -185,7 +185,7 @@ def test_caption_products_keeps_failed_items_with_no_visual_segment(tmp_path):
 
     for ok_id in ("OK1", "OK2"):
         assert by_id.loc[ok_id, "visual_caption"] == "a wooden chair with armrests"
-        assert by_id.loc[ok_id, "doc_text"].endswith("visual: a wooden chair with armrests")
+        assert "visual: a wooden chair with armrests" in by_id.loc[ok_id, "doc_text"]
 
     # Every row keeps a non-empty doc_text — captioning failures degrade to text-only,
     # they never blank out the document (that would silently break retrieval for the item).

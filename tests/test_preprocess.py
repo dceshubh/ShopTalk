@@ -141,6 +141,25 @@ def test_build_doc_text_appends_visual_caption_when_present():
     assert text.endswith("visual: a clear case with a marble pattern")
 
 
+def test_build_doc_text_places_visual_caption_before_bullet_points_and_keywords():
+    # Encoders truncate from the end — placing `visual: <caption>` ahead of the bulky
+    # bullet_points/keywords blocks keeps it in the surviving prefix on long listings,
+    # instead of being the first thing chopped off (see clean.py: build_doc_text docstring).
+    text = build_doc_text(
+        name="Mid-Century Walnut Chair",
+        brand="Rivet",
+        product_type="CHAIR",
+        color="Walnut",
+        material="Wood",
+        bullet_points=["Solid wood frame"],
+        keywords=["chair"],
+        visual_caption="a wooden chair with armrests",
+    )
+    visual_idx = text.index("visual: a wooden chair with armrests")
+    assert visual_idx < text.index("Solid wood frame")
+    assert visual_idx < text.index("keywords: chair")
+
+
 def test_build_doc_text_omits_missing_optional_fields():
     text = build_doc_text(
         name="Generic Item",

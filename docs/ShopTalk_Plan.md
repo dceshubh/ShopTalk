@@ -101,8 +101,12 @@ Every phase below is engineered to produce evidence for these.
 **Canonical product document** (the unit we embed):
 ```
 [name] · [brand] · type: [product_type] · color: [color] · material: [material]
-· [bullet_points] · keywords: [item_keywords] · visual: [BLIP-2 caption]
+· visual: [BLIP-2 caption] · [bullet_points] · keywords: [item_keywords]
 ```
+*(Caption sits ahead of the bulkier bullet_points/keywords blocks — not at the very end —*
+*so encoders that truncate from the tail keep the visual signal even on long listings;*
+*see `build_doc_text` in `src/preprocess/clean.py` and the captioning-stage truncation*
+*analysis in `docs/PROJECT_REPORT.md` §2.6.)*
 
 ### 2.2 Models — what, why, and the comparisons that earn rubric points
 
