@@ -26,9 +26,12 @@ pillow==10.4.0
 chromadb==0.5.15
 
 # --- Agent / LLM orchestration ---
+# Generator LLM is Groq-hosted (not local Ollama) — avoids a 5-7GB model competing for the
+# M3's 16GB unified memory alongside FastAPI/Streamlit/Chroma/Whisper. See PROJECT_REPORT.md
+# §5 for the pivot rationale; doesn't change Phase 3's retrieval evals (orthogonal to the LLM).
 langgraph==0.2.39
 langchain-core==0.3.13
-ollama==0.3.3
+groq==1.4.0
 redis==5.1.1
 
 # --- API / UI ---

@@ -271,18 +271,20 @@ Every phase below is engineered to produce evidence for these.
 ### Phase 5 — RAG generation + LangGraph agent + memory
 **Goal:** Turn retrieval into a conversational assistant with multi-turn memory. (Rubric #5; creativity.)
 **Build:**
-- `src/agent/`: LangGraph graph — (1) history-aware query rewrite, (2) Pydantic filter extraction, (3) `search_products` tool → Chroma, (4) optional cross-encoder rerank, (5) generator LLM (Ollama Qwen2.5-7B) phrases results + asks an upsell follow-up.
-- **Memory:** short-term buffer (RAM) per session; **Redis** persistent prefs (size/budget/recipient).
-- Optional reranker A/B (Precision@K with vs without).
+- `src/agent/`: LangGraph graph — (1) history-aware query rewrite + Pydantic filter extraction in one call (`filters.extract_filters`), (2) `search_products` node → Chroma "SQL-then-semantic" (`filters_to_where` + `index.build.search`), (3) generator LLM (**Groq-hosted `llama-3.1-8b-instant`**, OpenAI-compatible chat-completions API) phrases results + asks an upsell follow-up.
+- **Memory:** short-term `ConversationBuffer` (RAM, capped, per session — lost on restart by design); **Redis-backed `PersistentMemory`** storing `UserPreferences` (recipient/budget/size/colors) as JSON, surviving restarts.
+- Optional reranker A/B (Precision@K with vs without) — deferred; not required for the exit gate and the dev-scale sweep already shows P@1 ≈ 0.98 on the chosen encoder/corpus, leaving little headroom for rerank to demonstrate.
+
+**Compute pivot (deviation from the original plan, decided after Phase 3):** the plan originally named a local Ollama-hosted **Qwen2.5-7B** as the generator LLM. Running a 7B model locally alongside FastAPI + Streamlit + Chroma + Whisper would push the M3's 16 GB unified memory uncomfortably tight (per §8's M3 watch-outs). Switched to **Groq's free-tier hosted inference** instead — $0 cost, an OpenAI-compatible API, and zero local RAM footprint. Verified Groq's actual model catalog (not the originally-named family) before committing: `llama-3.1-8b-instant` (560 tokens/s, $0.05/$0.08 per 1M tokens) is the stable production-tier default; `llama-3.3-70b-versatile` is wired as a `compare` option; `qwen/qwen3-32b` exists on Groq but is preview-only ("may be discontinued at short notice") and was avoided for reproducibility. This pivot is orthogonal to the Phase 3 retrieval evals (the generator LLM never touches retrieval/ranking).
 
 **Exit-gate tests:**
-- [ ] Multi-turn works: "red shirt for my son" → results → "cheaper ones" correctly reuses context (scripted 5-turn test).
-- [ ] Filter extraction returns valid Pydantic objects on 20 varied queries (no parse failures).
-- [ ] Persistent pref survives a session restart (write → restart → recall).
-- [ ] Generated answers cite real retrieved `product_id`s (no hallucinated products — assert every cited id ∈ retrieved set).
-- [ ] Reranker A/B documented.
+- [x] Generated answers cite real retrieved `product_id`s (no hallucinated products — assert every cited id ∈ retrieved set). **Structural, not prompt-hoped**: `AgentTurn.product_ids` is *always exactly* `retrieved_ids` from the search step, never parsed out of LLM free text — the LLM only narrates products it's handed, it can never "show" one that wasn't retrieved. Proven with a fake LLM response containing a fabricated id (`B00FAKE0001`) that provably does not leak into `turn.product_ids` (`tests/test_graph.py::test_shopping_agent_product_ids_are_sourced_from_retrieval_not_from_llm_text`).
+- [x] Persistent pref survives a session restart (write → restart → recall). Tested against **real local Redis** (`db=15`, isolated from dev's `db=0`) with a genuinely fresh client/connection standing in for a process restart (`tests/test_memory.py`, `tests/test_graph.py::test_shopping_agent_persisted_preference_survives_a_fresh_connection`).
+- [x] Multi-turn works: history correctly carried across turns within one session, and isolated per session (`tests/test_graph.py::test_shopping_agent_carries_conversation_history_across_turns_in_one_session`, `::test_shopping_agent_keeps_separate_buffers_per_session`) — verified at the wiring level with a mocked LLM (no `GROQ_API_KEY` required for these).
+- [ ] Filter extraction returns valid Pydantic objects on 20 varied *live* queries (no parse failures), and the scripted 5-turn "red shirt for my son" → "cheaper ones" conversation, against the **real** Groq API — pending `GROQ_API_KEY` (unit-level extraction wiring and schema validation are already covered with a faked client in `tests/test_filters.py` / `tests/test_llm.py`).
+- [ ] Reranker A/B documented (optional — deferred, see above).
 
-**Rubric:** #5 (conversational), creativity. **Artifacts:** agent module, conversation transcripts, rerank A/B.
+**Rubric:** #5 (conversational), creativity. **Artifacts:** `src/agent/{llm,memory,filters,graph}.py` + `src/common/secrets.py`, 35 passing tests (`tests/test_{llm,memory,filters,graph}.py`).
 **REVIEW CHECKPOINT 5 →** you test the conversation quality.
 
 ---

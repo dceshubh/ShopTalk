@@ -448,6 +448,144 @@ is proven.*
 
 ## 5. Agent + memory layer
 
+**Status:** complete (unit/integration-tested with mocked LLM + real local Redis; live
+multi-turn verification against the real Groq API pending `GROQ_API_KEY`).
+
+### 5.1 Generator-LLM pivot — Groq-hosted, not local Ollama
+
+The plan originally named a local Ollama-hosted **Qwen2.5-7B** as the generator LLM. Running
+a 7B model locally alongside FastAPI + Streamlit + Chroma + faster-whisper would push the M3's
+16 GB unified memory uncomfortably tight (§8 of the plan already flagged this as the
+M3-specific watch-out). Pivoted to **Groq's free-tier hosted inference** instead:
+
+- $0 cost, OpenAI-compatible `chat.completions` API, zero local RAM footprint — the generator
+  LLM is orthogonal to the Phase 3 retrieval evals (it never touches embeddings or ranking),
+  so the pivot doesn't disturb any already-measured number.
+- Verified Groq's *actual* hosted-model catalog via a live fetch before writing any model name
+  into code (per the "don't fabricate APIs — mark inferred" convention): chose
+  **`llama-3.1-8b-instant`** (560 tokens/s, $0.05 / $0.08 per 1M input/output tokens) as the
+  primary, stable, production-tier model, with `llama-3.3-70b-versatile` wired as a `compare`
+  option. `qwen/qwen3-32b` exists on Groq but is explicitly **preview**-labeled ("may be
+  discontinued at short notice") and was avoided for reproducibility.
+- `configs/config.yaml` → `models.generator_llm`, `.env.example` → `GROQ_API_KEY` /
+  `REDIS_URL`. `requirements.txt`: `ollama==0.3.3` → `groq==1.4.0`.
+
+### 5.2 `src/agent/llm.py` — `GeneratorLLM` + Pydantic-structured output via JSON mode
+
+A thin wrapper dataclass around the Groq client exposing two methods:
+- `complete(messages, *, temperature, max_tokens) -> str` — free-text chat, used for the final
+  conversational response.
+- `complete_structured(messages, response_model: type[T], *, temperature=0.0) -> T` — the
+  project's "Pydantic > regex" convention applied to LLM extraction: requests
+  `response_format={"type": "json_object"}`, injects the target model's
+  `model_json_schema()` into the system message (creating one if absent, augmenting in place
+  if present — never appending an extra message), and validates the raw JSON response into a
+  real Pydantic instance via `response_model.model_validate_json`. A schema-violating response
+  raises `pydantic.ValidationError` — a malformed extraction is a real, visible failure, not
+  silently swallowed into `None`s.
+
+`load_generator(model_name=None)` reads `GROQ_API_KEY` via `src/common/secrets.get_env(...,
+required=True)`, which raises a `RuntimeError` pointing at `.env.example` immediately on a
+missing key — surfacing a misconfigured run at startup rather than as a cryptic 401 three
+calls deep. 8 tests in `tests/test_llm.py`, Groq client faked throughout (a real call costs
+money and needs the key); what's asserted is the part most likely to be silently wrong — that
+`complete_structured` actually constrains the model to the schema and produces a validated
+instance, not raw text.
+
+### 5.3 `src/agent/memory.py` — two-tier memory (per plan §2.5)
+
+- **`ConversationBuffer`** — short-term, in-RAM, capped at `max_turns` (default 10 → 20
+  messages), one per `session_id`. Lost on restart **by design** — it's per-conversation
+  scratch space, not a durable record.
+- **`PersistentMemory`** — Redis-backed, stores `UserPreferences` (Pydantic: recipient, budget
+  ceiling, preferred size, preferred colors) as a JSON blob keyed by `user_id`, surviving
+  restarts/sessions. `merge(user_id, partial)` layers only the *non-empty* fields of a new
+  partial profile onto the existing one (`current.model_copy(update=updates)`) — a turn that
+  only mentions color must not erase a recipient or budget learned three turns earlier.
+- **Redis runs via Homebrew, not Docker** (`brew install redis && brew services start redis`,
+  verified with `redis-cli ping` → `PONG`) — lighter-weight (~10–50 MB RAM) than the plan's
+  original Docker-based assumption, and one less moving part on a memory-constrained machine.
+- 8 tests in `tests/test_memory.py` run against a **real local Redis** on a dedicated `db=15`
+  (isolated from dev's `db=0`; fixture pings — skips cleanly if Redis isn't running — and
+  flushes its own keys before *and* after each test). This is deliberate: the exit gate is "a
+  persisted pref survives a session restart," and a faked Redis client cannot prove that a
+  `model_validate_json(model_dump_json(...))` round-trip actually works against the real wire
+  format. One test (`test_persisted_pref_survives_a_fresh_client_connection`) opens a brand-new
+  `redis.from_url(...)` connection — not the same client object — to genuinely stand in for a
+  process restart rather than just re-reading from an already-open handle.
+
+### 5.4 `src/agent/filters.py` — combined query rewrite + structured filter extraction
+
+One LLM call produces both a history-resolved, standalone search string (`rewritten_query`)
+and structured `SearchFilters` (`product_type` / `color` / `material` / `brand`, all
+`Optional[str]`) — cheaper than two separate calls and internally consistent (the rewrite and
+the extracted attributes can't disagree about what the shopper is asking for).
+`filters_to_where(filters)` converts the extracted filters into the exact Chroma `where`-clause
+shape `src.index.build.search` expects: `None` when nothing was extracted, a bare
+`{"column": "value"}` for a single attribute, or `{"$and": [...]}` (in fixed
+`METADATA_COLUMNS` order) for multiple — mirroring the "SQL-then-semantic" pre-filter pattern
+already proven in the Phase 3 structured-filter check (21/22 cases, 0 violations). 10 tests in
+`tests/test_filters.py`, including a parametrized sweep over all four metadata columns and an
+explicit check that `rewritten_query` (search *text*) never leaks into the metadata `where`
+clause.
+
+### 5.5 `src/agent/graph.py` — the LangGraph pipeline + `ShoppingAgent` orchestration
+
+A compiled `StateGraph(AgentState)` wiring three nodes in a strict line:
+
+```
+START -> understand_query -> search_products -> generate_response -> END
+```
+
+- **`understand_query`** — calls `extract_filters`; writes `filters` into state.
+- **`search_products`** — converts `filters` to a Chroma `where` via `filters_to_where`, runs
+  `index.build.search(collection, encoder, filters.rewritten_query, top_k=, where=)`; writes
+  `retrieved_ids`.
+- **`generate_response`** — renders each retrieved product as one grounding line
+  (`_describe_products`: `[item_id] truncated_document (attr=value, ...)`, capped at 200 chars
+  of document text so the prompt stays bounded), builds a message list of
+  `[system_prompt, *history, user_message + grounding]`, and calls `llm.complete(...)`.
+
+**The key architectural decision — anti-hallucination is structural, not a prompt hope:**
+`AgentTurn.product_ids` is *always exactly* `list(result["retrieved_ids"])` — never parsed out
+of the LLM's generated free text. This makes the exit gate "generated answers cite real
+retrieved `product_id`s (no hallucinated products)" true **by construction**: the product
+references surfaced to the caller are the retrieval result, full stop; the LLM only ever
+narrates the products it's handed and structurally cannot cause a different id to be "shown."
+Proven directly in `tests/test_graph.py::test_shopping_agent_product_ids_are_sourced_from_retrieval_not_from_llm_text`
+— a fake LLM response that explicitly recommends a fabricated id (`B00FAKE0001`, absent from
+`retrieved_ids=["REAL1", "REAL2"]`) is asserted to leave `turn.product_ids == ["REAL1",
+"REAL2"]`, with the fabricated id provably absent. This was a deliberate choice over the
+alternative — regex-extracting cited ids from LLM prose and checking them against the
+retrieved set at runtime — which would be fragile (depends on the LLM consistently formatting
+ids the same way) and contradicts the project's "Pydantic > regex" convention.
+
+`ShoppingAgent` is the orchestration object the future API/UI talk to: one compiled graph +
+one `ConversationBuffer` per `session_id` (created lazily via `setdefault`, so concurrent
+sessions never share history) + one shared `PersistentMemory`. Each `chat(user_id, session_id,
+message)` call: replays the session's buffered history into the graph, builds an `AgentTurn`
+from the result, appends the new user/assistant messages to the buffer, and merges
+`_prefs_from_filters(filters)` (today: only `color` → `preferred_colors`, since the catalog
+filter schema doesn't yet carry recipient/budget/size — `merge`'s non-destructive layering
+means those fields stay intact for `PersistentMemory` to fill in once richer extraction lands)
+into the user's persistent profile.
+
+9 tests in `tests/test_graph.py` cover node wiring (`understand → search → generate` order,
+`where`-clause construction for both filtered and unfiltered queries), the anti-hallucination
+property, multi-turn history propagation within a session, per-session buffer isolation, and
+(against real local Redis, `db=15`) persistent-preference merging and survival across a fresh
+connection.
+
+### 5.6 Test summary
+
+35 new tests across `tests/test_{llm,memory,filters,graph}.py`, all passing; full suite
+(116 tests) green with no regressions to the Phase 3 retrieval-eval tests. Live
+integration checks that require a real Groq call — the scripted 5-turn "red shirt for my son"
+→ "cheaper ones" conversation and the 20-varied-query filter-extraction parse-failure sweep —
+are written against the real API path but pending a `GROQ_API_KEY` in `.env`.
+
+## 6. API, UI, voice
+
 *Pending — not yet started.*
 
 ## 6. API, UI, voice

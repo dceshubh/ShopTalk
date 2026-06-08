@@ -39,10 +39,15 @@ models:
   multimodal_encoder: "openai/clip-vit-base-patch32"
   reranker: "BAAI/bge-reranker-base"
   generator_llm:
-    primary: "qwen2.5:7b-instruct"   # via Ollama
-    dev: "qwen2.5:3b-instruct"        # lighter model for local iteration (16GB unified mem)
+    # Groq-hosted (not local Ollama) — a 5-7GB local model competes for the M3's 16GB
+    # unified memory alongside FastAPI/Streamlit/Chroma/Whisper (see docs/ShopTalk_Plan.md
+    # §8 M3 watch-outs). Groq's free tier is fast + ~$0 at this project's scale, and this
+    # swap is orthogonal to the Phase-3 retrieval evals (generator LLM never touches them).
+    # Requires GROQ_API_KEY in .env — see .env.example.
+    provider: "groq"
+    primary: "llama-3.1-8b-instant"   # production-tier, 560 T/s, $0.05/$0.08 per 1M tokens
     compare:
-      - "llama3.1:8b-instruct"
+      - "llama-3.3-70b-versatile"     # stronger/larger — A/B for the rerank & generation-quality comparisons
   stt: "faster-whisper-small"
   tts: "piper"
 
