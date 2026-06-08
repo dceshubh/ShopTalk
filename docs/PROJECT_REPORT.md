@@ -576,13 +576,28 @@ property, multi-turn history propagation within a session, per-session buffer is
 (against real local Redis, `db=15`) persistent-preference merging and survival across a fresh
 connection.
 
-### 5.6 Test summary
+### 5.6 Test summary — including live Groq integration runs
 
 35 new tests across `tests/test_{llm,memory,filters,graph}.py`, all passing; full suite
-(116 tests) green with no regressions to the Phase 3 retrieval-eval tests. Live
-integration checks that require a real Groq call — the scripted 5-turn "red shirt for my son"
-→ "cheaper ones" conversation and the 20-varied-query filter-extraction parse-failure sweep —
-are written against the real API path but pending a `GROQ_API_KEY` in `.env`.
+(116 tests) green with no regressions to the Phase 3 retrieval-eval tests.
+
+With `GROQ_API_KEY` configured, both remaining live-integration exit gates were run against
+the **real** Groq API + the real `bge-base-en-v1.5`/`caption_enriched` index + real Redis:
+
+- **20-varied-query filter-extraction sweep**: 20/20 queries parsed into valid `SearchFilters`
+  Pydantic objects, 0 parse failures (free-tier 429s were transparently auto-retried by the
+  Groq SDK's backoff — no application-level handling needed).
+- **Scripted 5-turn conversation** ("red shirt for my son" → "anything cheaper?" → "in blue
+  instead?" → "for a formal occasion" → "which one would you recommend?"): each turn's
+  `rewritten_query` correctly resolved references to prior turns purely from the LLM-extracted
+  rewrite — e.g. turn 3 ("what about in blue instead?") resolved to `"blue shirts"`, reusing
+  "shirt" from turn 1 with no explicit restatement. The final recommendation cited only ids
+  from that turn's actual `retrieved_ids` (`['B07C3S5J4L', 'B07R673D9Y', 'B07WZ56XPY',
+  'B079TYG3RP']`) — the anti-hallucination property held end-to-end, not just in the mocked
+  unit test. `preferred_colors=['Blue']` was correctly merged into the user's persistent Redis
+  profile by the run's end. (Turns 1–4 correctly reported "no shirts available" — the
+  dev-scale 200-item corpus is furniture-only, so this is accurate grounding, not a bug; turn
+  5's broader `{"color": "Blue"}` filter is what surfaced the 4 real results.)
 
 ## 6. API, UI, voice
 
