@@ -601,11 +601,123 @@ the **real** Groq API + the real `bge-base-en-v1.5`/`caption_enriched` index + r
 
 ## 6. API, UI, voice
 
-*Pending — not yet started.*
+**Status:** API complete and live-verified end-to-end (`src/api/`); UI and voice pending.
 
-## 6. API, UI, voice
+### 6.1 `src/api/main.py` — FastAPI inference service, models loaded ONCE at startup
 
-*Pending — not yet started.*
+The rubric's "Excellent" column names this exact phrase — "model loaded once at startup, not
+per request" — so it's the load-bearing design constraint, not a nice-to-have:
+
+- **`lifespan`-based startup**: a single `loader()` callable builds one `RuntimeModels`
+  (the compiled `ShoppingAgent` + `ProductCatalog` + model identities) and freezes it into
+  `app.state.models`. `app.state.load_count` is incremented exactly once per app lifecycle and
+  surfaced via `/health` — turning "proven by logs" into something a test can assert from the
+  outside: `tests/test_api.py::test_health_reports_loaded_model_identities_and_load_count_of_one`
+  hits `/health` three times and checks `load_count == 1` every time. A live run against the
+  real stack (Groq + `bge-base-en-v1.5` + the 39,733-row catalog + Redis) confirms the same:
+  `{"load_count": 1, "catalog_size": 39733, ...}`, with a one-time ~17 s startup cost logged via
+  the project's shared `Timer`.
+- **App-factory pattern** (`create_app(*, loader=_load_real_models)`): production
+  (`app = create_app()`) and the test suite share every route, middleware, and exception
+  handler; only `loader` differs. Tests substitute a loader that builds a **real**
+  `ShoppingAgent` (so session-buffer logic is genuinely exercised) wired to a faked
+  LLM/collection/encoder (so no Groq/Chroma network calls happen) — the same "fake the
+  expensive edge, prove the wiring" split as `tests/test_graph.py`. One test still loads the
+  real encoder + index where the gate specifically requires it (§6.4, parity, below).
+- **Endpoints**: `POST /chat` (turn the agent's response into `{response_text, products[]}`),
+  `GET /health` (model identities + `load_count` + catalog size), `GET /products/{item_id}`
+  (single product card, structured `404` if unknown), `GET /images/{path}` (static mount over
+  `captioning.images_cache_dir`).
+
+### 6.2 `src/api/catalog.py` — product-card resolution, same-data parity
+
+`ProductCatalog` resolves the agent's retrieved `item_id`s into the display fields a UI needs
+(`name`, `image_path`, `product_type`/`color`/`material`/`brand`) by reading the **same**
+`products_parquet` the offline indexer reads (`paths.products_parquet`, loaded once at
+startup, NaN→`None` so Pydantic sees clean `Optional[str]`s) — one more "shared module, same
+data" instance rather than a second hand-rolled lookup that could quietly drift from the
+index.
+
+### 6.3 Structured contracts — Pydantic schemas, structured errors, request IDs
+
+- **`src/api/schemas.py`**: `ChatRequest`/`ChatResponse`/`ProductCard`/`HealthResponse`/
+  `ErrorDetail` — Pydantic models, not ad-hoc dicts (the project's "Pydantic > regex/dicts"
+  convention extended to API contracts). `response_model=...` on every route gets the OpenAPI
+  schema (`/docs`) for free and makes a malformed payload fail validation with a structured
+  `422`, not an obscure downstream `AttributeError`.
+- **Structured error handling**: `RequestValidationError` → `422` with field-level Pydantic
+  `errors[]`; `HTTPException` (e.g. unknown product id) → its declared status with a
+  structured body; an unhandled `Exception` → `500` with a generic message — **every** error
+  path returns `{request_id, message, ...}` JSON, never a raw stacktrace. Live-verified:
+  `curl -X POST /chat -d '{"message": ""}'` → `422` with
+  `{"errors": [{"type": "string_too_short", "loc": ["body", "message"], ...}]}`;
+  `curl /products/NOPE000000` → `404` with `{"message": "Unknown product id 'NOPE000000'"}`.
+  Both carry a `request_id` (also emitted in the corresponding log line and the
+  `X-Request-ID` response header) so a user-reported failure can be traced to its exact log
+  entry.
+- **Request-ID + latency middleware**: every request gets a `uuid4` `request_id` (propagated
+  through `request.state`, response headers, and all log lines for that request) and a
+  per-request latency measurement using the project's shared `Timer` — the same instrument
+  used for every other latency number in the codebase, so `/chat` numbers are directly
+  comparable to offline-stage numbers when the Phase-10 P95/P99 pass runs.
+
+### 6.4 Transformer parity — "same query → API result == offline notebook result"
+
+The rubric calls this out explicitly, and it's true here **structurally**, not by careful
+manual alignment: `_search_products_node` (in the online agent graph) and the Phase-3 eval
+harness both call the *identical* `src.index.build.search(collection, encoder, query, ...)` —
+same `Encoder` instance, same `collection`, same prefix convention. Rather than assert this by
+code inspection, `tests/test_api.py::test_search_parity_between_chat_path_and_offline_search`
+**proves** it: it loads the real `bge-base-en-v1.5` encoder and the real
+`caption_enriched` index (no `GROQ_API_KEY` needed — only the agent's filter-extraction LLM is
+faked, forced to rewrite to the *exact* offline query string), runs the same query text
+through both the online graph and a direct offline `search()` call, and asserts **byte-identical
+ranked-id lists**. Skips cleanly if the dev-scale index isn't built.
+
+### 6.5 Concurrency — parallel sessions can't corrupt each other's history
+
+`tests/test_api.py::test_concurrent_chats_across_sessions_do_not_corrupt_each_others_history`
+fires 10 parallel `/chat` calls (one distinct `session_id` each, `ThreadPoolExecutor`) against
+a real `ShoppingAgent` and asserts every session's `ConversationBuffer` contains *only* its own
+message. This isn't incidental — `ShoppingAgent._buffers.setdefault(session_id, ...)` is a
+single atomic dict operation under the GIL, and per-session keys mean there is no shared
+mutable state between sessions for a race to corrupt.
+
+### 6.6 Live end-to-end smoke test
+
+Booted the real server (`uvicorn src.api.main:app`) against the full stack — real Groq, real
+`bge-base-en-v1.5` encoder + 39,733-row `caption_enriched` index, real Redis, real
+`products.parquet` catalog — and exercised every endpoint with `curl`:
+
+```
+GET  /health        -> {"load_count": 1, "catalog_size": 39733, "collection": "bge-base-en-v1-5__caption_enriched", ...}
+POST /chat          -> {"response_text": "...Stone & Beam Fischer Sleeper Chair...",
+                         "products": [{"item_id": "B07HZ1RYNT", "name": "...", "image_path": "c0/c096fa8d.jpg",
+                                       "product_type": "CHAIR", "color": "Brown", "material": "Leather", "brand": "Stone & Beam"}]}
+GET  /products/B07HZ1RYNT  -> 200, the same card
+GET  /products/NOPE000000  -> 404, {"request_id": "...", "message": "Unknown product id 'NOPE000000'"}
+POST /chat {"message": ""} -> 422, {"request_id": "...", "errors": [{"type": "string_too_short", ...}]}
+GET  /images/<dev-sample path>  -> 200 (serves real product photos for the ~200-image local sample)
+GET  /docs                       -> 200 (OpenAPI schema renders)
+```
+
+The `/images` mount correctly returns `404` for the ~39,500 catalog items whose photos exist
+only in the full ABO archive, which was deliberately never pulled to the Mac (§8) — a known
+dev-scale data-availability gap (the same gap any product outside the local 200-image sample
+has), not an API defect.
+
+### 6.7 Test summary
+
+10 tests in `tests/test_api.py`, all passing — `/health` load-once proof, `/chat` schema +
+grounded product cards + structured-422 validation, `/products/{id}` success + structured-404,
+the live transformer-parity check, and the 10-way concurrency test. Full suite green at 126
+tests with no regressions.
+
+### 6.8 Pending — UI and voice
+
+Streamlit UI (chat + voice + product cards + filters + 👍/👎) and the voice pipeline
+(faster-whisper STT / Piper TTS) are not yet started — tracked as their own phases in
+`docs/ShopTalk_Plan.md` (Phase 7, Phase 8).
 
 ## 7. End-to-end testing & latency (P95/P99)
 
