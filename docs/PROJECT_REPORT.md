@@ -808,9 +808,98 @@ rendered card with the real name/attributes/link, and working, stably-keyed 👍
 all in one turn, no instructions needed. (The card's image itself 404s — same known dev-scale
 gap as §6.6: this product's photo lives only in the full ABO archive, never pulled locally.)
 
-### 6.9 Pending — voice
+### 6.9 `src/voice/{stt,tts}.py` + UI wiring — voice mode (faster-whisper / Piper)
 
-The voice pipeline (`faster-whisper` STT / Piper TTS) is not yet started.
+A toggleable "🎙️ Voice mode" in the sidebar that lets a shopper speak their query and hear
+the response — the rubric's "speech-to-text input / text-to-speech output (optional, for
+extra credit)" line, built end-to-end and live-verified rather than stubbed.
+
+- **`Transcriber` (`src/voice/stt.py`)** wraps `faster-whisper`'s `WhisperModel` (CTranslate2
+  backend). Deliberately **does not** call the project's `resolve_device()` MPS-detection
+  helper (§5.1's Ollama pivot uses it) — `faster-whisper`/CTranslate2 supports CPU and CUDA
+  but **not Apple's MPS**, so the loader is hard-pinned to `device="cpu", compute_type="int8"`.
+  `.transcribe(audio: str | Path | bytes)` wraps raw bytes in an in-memory `io.BytesIO` (no
+  temp files) and joins segment texts into one string.
+- **`Speaker` (`src/voice/tts.py`)** wraps Piper's `PiperVoice`. Piper's streaming-WAV API
+  (`voice.synthesize_wav(text, wav_file)`) writes through the stdlib `wave.Wave_write`
+  interface — `.synthesize(text) -> bytes` hands it an in-memory `io.BytesIO` wrapped in
+  `wave.open(..., "wb")` and returns the assembled WAV bytes directly, again with no temp
+  files. `load_speaker` raises a `FileNotFoundError` that names the *exact*
+  `python -m piper.download_voices --download-dir <dir> <voice>` command to run if the
+  `.onnx` model is missing — a deliberately actionable error for a one-time setup step.
+- **One query path, not two:** transcribed text is assigned to the *same* `prompt` variable
+  `st.chat_input` would populate, then flows through the existing `_apply_sidebar_filters` →
+  `/chat` pipeline (§6.8) unchanged — mirroring how sidebar filters were folded into the
+  message text rather than routed through a parallel mechanism. A `file_id`-keyed guard
+  (`st.session_state["_last_voice_upload_id"]`) stops Streamlit's persistent `file_uploader`
+  from re-transcribing the same clip on every unrelated rerun (e.g. a 👍 click).
+- **Upload, not live mic:** `st.audio_input` (live browser recording) only landed in
+  Streamlit 1.40+; this project is pinned to `streamlit==1.39.0` (§6.8 footnote on
+  `use_container_width`), so voice input goes through `st.file_uploader` — the shopper
+  records/picks an audio clip and uploads it. Functionally equivalent for demo purposes;
+  documented here as a version-driven scope call, not an oversight.
+- **Audio is synthesized and stored once per turn**, alongside `response_text` and
+  `product_ids` in `st.session_state.messages[-1]["audio"]`, and rendered via
+  `st.audio(..., format="audio/wav")` both for the live turn and on history replay — so
+  re-running the script (e.g. on a feedback click) never re-synthesizes speech for old turns.
+
+**Live round-trip verification** (real `faster-whisper-small` + real `en_US-lessac-low`
+Piper voice, no mocking): uploading a recording of "Show me red running shoes." transcribed
+correctly in **1.64 s**; synthesizing the assistant's reply produced a playable WAV in
+**0.38 s**. Both legs comfortably clear the plan's <2 s voice-latency budget, and the
+text-chat path remains fully available with voice mode off — speech is additive, never a
+hard dependency.
+
+**Testing approach:** 6 tests in `tests/test_voice.py` (model-loading device/compute-type
+pinning, segment joining, bytes→`BytesIO` wrapping, the `load_speaker` error message, and a
+faithful fake `PiperVoice` proving the real `wave` module assembles a correct WAV) plus 2 in
+`tests/test_ui_app.py` (the checkbox reveals an upload control; a turn's audio is synthesized,
+stored, and rendered). One gap, noted for completeness: the pinned `AppTest` has no
+`file_uploader` simulation proxy, so the upload→transcription leg is covered at the wrapper
+level (`test_voice.py`) plus the live round trip above, not via `AppTest`.
+
+### 6.10 `src/agent/personalize.py` + `src/eval/hard_negatives.py` — feedback loop & personalization
+
+Closes the loop the 👍/👎 buttons (§6.8) opened: feedback now *visibly* changes what a
+returning shopper sees, and doubles as raw material for the next fine-tuning round (§4).
+
+- **`Personalizer.rerank`** retrieves a `pool_size`-deep candidate pool (`personalization_pool_size:
+  30`, 3× the shown `top_k` — one extra `n_results` on the same `collection.query` call, no
+  added latency) and *reorders* it per-user using two already-paid-for signals: this user's
+  past 👍/👎 verdicts (`FeedbackStore`, §6.8) and their persisted `preferred_colors`
+  (`PersistentMemory`, §5.3). Score = base similarity rank plus signed deltas
+  (`_DOWNVOTE_PENALTY = 1000`, `_LIKED_BEFORE_BOOST = 5`, `_PREFERRED_COLOR_BOOST = 3`),
+  sorted descending, truncated to `top_k`.
+- **Re-ranking only, never a different result set** — `rerank` always returns ids drawn from
+  `candidate_ids`, so `src.agent.graph`'s structural "no hallucinated products" guarantee
+  (§5.5) is untouched: every shown product still came from the real similarity search.
+  A user with no feedback/preference history gets back `candidate_ids[:top_k]`, byte-for-byte.
+- **A single 👎 always outweighs any combination of boosts** (`_DOWNVOTE_PENALTY` dwarfs the
+  boost constants) — re-surfacing something a user explicitly rejected just because it also
+  matches their favorite color would make the feedback buttons feel cosmetic, not functional.
+- **`mine_hard_negatives` (`src/eval/hard_negatives.py`)** cross-joins same-user/same-query
+  👍+👎 pairs from the feedback store into `HardNegativeTriplet(query, positive_item_id,
+  negative_item_id)` rows ready for `MultipleNegativesRankingLoss`/`TripletLoss` in the next
+  fine-tuning pass. Deliberately **not** cross-query: pairing a 👎 from one search with a 👍
+  from an unrelated one would teach the encoder a relevance association neither user actually
+  made — worse than no signal at all.
+
+**Live verification against the real index** (`bge-base-en-v1.5`, 200-doc dev sample, no
+mocking): for the query "brown chairs," the unpersonalized top-10 ranked `B07HZ1RYNT` first
+and `B072Z6K34L` sixth. After recording a 👎 on `B07HZ1RYNT` and a 👍 on `B072Z6K34L` for a
+`demo-user`, the personalized top-10 dropped `B07HZ1RYNT` out entirely and promoted
+`B072Z6K34L` to rank 0 — the exit gate "personalized vs non-personalized results differ for
+a user with history," demonstrated with real ids and real rank deltas, not a synthetic fixture.
+
+**Testing approach:** 7 tests in `tests/test_personalize.py` against a real SQLite
+`FeedbackStore` (no-history-unchanged, downvote-demoted, per-user scoping, like-boosted,
+color-preference-boosted, personalized-vs-unpersonalized differ, single-downvote-beats-all-
+boosts) and 5 in `tests/test_hard_negatives.py` (pair→triplet, no-match→empty, multi-pair
+cross-join, cross-user pairing forbidden, field validity). `tests/test_graph.py`/
+`tests/test_api.py` gained a `_passthrough_personalizer()` fake (returns
+`candidate_ids[:top_k]` unchanged) so the existing retrieval-wiring tests stay focused on
+retrieval, mirroring the established `_noop_memory()` convention for separating concerns
+across fakes.
 
 ## 7. End-to-end testing & latency (P95/P99)
 
@@ -822,7 +911,7 @@ The voice pipeline (`faster-whisper` STT / Piper TTS) is not yet started.
 
 ---
 
-*Last updated: 2026-06-08 — Streamlit UI + feedback store complete and live-verified
-end-to-end (§6.8); full suite green at 141 tests with no regressions. Remaining: fine-tuning
-(§4), voice (§6.9), E2E latency (§7), and deployment (§8) — see `docs/ShopTalk_Plan.md` §7
-for the current build order.*
+*Last updated: 2026-06-08 — voice mode (§6.9) and the feedback loop / personalization
+(§6.10) complete and live-verified end-to-end against real models and the real index; full
+suite green at 161 tests with no regressions. Remaining: fine-tuning (§4), E2E latency (§7),
+and deployment (§8) — see `docs/ShopTalk_Plan.md` §7 for the current build order.*

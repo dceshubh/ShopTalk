@@ -12,6 +12,7 @@ paths:
   chroma_dir: "data/chroma"
   feedback_db: "data/feedback/feedback.sqlite"
   weights_dir: "weights"
+  piper_voice_dir: "weights/piper"
 
 dataset:
   language_filter: "en"
@@ -51,10 +52,16 @@ models:
       - "llama-3.3-70b-versatile"     # stronger/larger — A/B for the rerank & generation-quality comparisons
   stt: "faster-whisper-small"
   tts: "piper"
+  tts_voice: "en_US-lessac-low"
 
 retrieval:
   top_k: 10
   rerank_top_n: 50
+  # How deep the agent searches before Phase-9 personalization re-ranks down to `top_k` —
+  # 3x gives re-ranking real headroom (a previously-liked item ranked 11th-30th by raw
+  # similarity can resurface near the top) without a noticeable latency cost (one
+  # `collection.query` call either way; only `n_results` changes).
+  personalization_pool_size: 30
   approaches:
     - "text_only"
     - "text_plus_image_caption"

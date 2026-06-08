@@ -14,8 +14,10 @@ import uuid
 import httpx
 import streamlit as st
 
-from src.common.config import load_config
+from src.common.config import load_config, resolve_path
 from src.ui.feedback import FeedbackStore, load_feedback_store
+from src.voice.stt import Transcriber, load_transcriber
+from src.voice.tts import Speaker, load_speaker
 
 # A curated subset of common attribute values for the sidebar filter UI — NOT the full
 # catalog vocabulary (that lives only in the API/index). "Any" means "let the agent's own
@@ -34,6 +36,22 @@ def _config():
 @st.cache_resource
 def _feedback_store() -> FeedbackStore:
     return load_feedback_store()
+
+
+@st.cache_resource
+def _transcriber() -> Transcriber:
+    """Loaded once per process — Whisper-small (~500 MB, CPU/int8) is too heavy to reload
+    on every rerun (`st.cache_resource` is the same singleton-cache pattern as `_feedback_store`)."""
+    return load_transcriber(load_config()["models"]["stt"])
+
+
+@st.cache_resource
+def _speaker() -> Speaker:
+    """Loaded once per process from the local Piper voice files — see `models.tts_voice`
+    and `paths.piper_voice_dir` in config.yaml, and the README "Voice mode" setup for how
+    those files get there (`python -m piper.download_voices`, a one-time ~60 MB download)."""
+    cfg = load_config()
+    return load_speaker(cfg["models"]["tts_voice"], voice_dir=resolve_path(cfg["paths"]["piper_voice_dir"]))
 
 
 def _init_session_state() -> None:
@@ -139,6 +157,13 @@ def main() -> None:
             "Selections are blended into your next message — ShopTalk's agent extracts them conversationally, same as if you'd typed them."
         )
         st.divider()
+        voice_mode = st.checkbox(
+            "🎙️ Voice mode",
+            value=False,
+            help="Upload a short voice clip instead of typing — ShopTalk transcribes it "
+            "(faster-whisper, runs locally) and speaks its reply back (Piper TTS, also local).",
+        )
+        st.divider()
         if st.button("New conversation"):
             st.session_state.session_id = f"session-{uuid.uuid4().hex[:8]}"
             st.session_state.messages = []
@@ -156,6 +181,8 @@ def main() -> None:
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.write(message["content"])
+            if message.get("audio"):
+                st.audio(message["audio"], format="audio/wav")
             if message.get("products") is not None:
                 _render_product_cards(
                     message["products"],
@@ -165,8 +192,28 @@ def main() -> None:
                 )
 
     prompt = st.chat_input("What are you shopping for?")
+
+    # Voice input: an uploaded clip is transcribed once (guarded by `file_id` so a rerun
+    # — e.g. clicking 👍 on a card — doesn't resubmit the same clip as a brand-new turn)
+    # and treated exactly like a typed `chat_input` value from here on — one query path,
+    # not two, same principle as `_apply_sidebar_filters` folding picks into the message text.
+    if voice_mode:
+        audio_upload = st.file_uploader(
+            "Or upload a voice clip (wav / mp3 / m4a / ogg)",
+            type=["wav", "mp3", "m4a", "ogg"],
+            key="voice_upload",
+        )
+        if audio_upload is not None and audio_upload.file_id != st.session_state.get("_last_voice_upload_id"):
+            st.session_state["_last_voice_upload_id"] = audio_upload.file_id
+            with st.spinner("Transcribing..."):
+                transcribed = _transcriber().transcribe(audio_upload.getvalue())
+            st.caption(f"🎙️ Heard: “{transcribed}”")
+            if transcribed:
+                prompt = transcribed
+
     if prompt:
-        st.session_state.messages.append({"role": "user", "content": prompt, "turn_id": uuid.uuid4().hex[:8]})
+        turn_id = uuid.uuid4().hex[:8]
+        st.session_state.messages.append({"role": "user", "content": prompt, "turn_id": turn_id})
         with st.chat_message("user"):
             st.write(prompt)
 
@@ -194,6 +241,11 @@ def main() -> None:
                 return
 
             st.write(result["response_text"])
+            audio_bytes = None
+            if voice_mode:
+                with st.spinner("Generating voice reply..."):
+                    audio_bytes = _speaker().synthesize(result["response_text"])
+                st.audio(audio_bytes, format="audio/wav")
             _render_product_cards(
                 result["products"], api_base_url=api_base_url, query=prompt, msg_key=f"turn-{turn_id}"
             )
@@ -205,6 +257,7 @@ def main() -> None:
                 "products": result["products"],
                 "query": prompt,
                 "turn_id": turn_id,
+                "audio": audio_bytes,
             }
         )
 

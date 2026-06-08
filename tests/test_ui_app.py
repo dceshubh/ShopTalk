@@ -182,6 +182,75 @@ def test_thumbs_up_persists_a_verdict_to_the_real_feedback_store(tmp_path):
     )
 
 
+# ---------------------------------------------------------------------------
+# Voice mode (docs/ShopTalk_Plan.md Phase 8) — toggle + TTS wiring.
+#
+# `AppTest` (pinned streamlit==1.39.0) has no proxy for simulating a `file_uploader`
+# upload, so the STT half (upload -> transcribe -> prompt) isn't exercisable from this
+# suite — it's covered at the wrapper level by tests/test_voice.py and was live-tested
+# end-to-end (see docs/ShopTalk_Plan.md Phase 8 exit gates). The TTS half needs no such
+# simulation: it fires unconditionally once a chat turn completes with voice mode on, so
+# the same `httpx.post` + chat_input drive used elsewhere reaches it directly.
+# ---------------------------------------------------------------------------
+
+
+def test_voice_mode_checkbox_reveals_an_audio_upload_control():
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+
+    voice_checkbox = next(c for c in at.checkbox if c.label == "🎙️ Voice mode")
+    assert voice_checkbox.value is False
+    elements_before = len(at.main.children)
+
+    voice_checkbox.set_value(True).run(timeout=30)
+
+    assert not at.exception
+    assert len(at.main.children) > elements_before  # the file_uploader rendered
+
+
+def test_voice_mode_speaks_the_response_and_stores_the_audio_with_the_turn():
+    """`AppTest` re-execs `app.py` per `.run()`, so — same gotcha as the feedback-store
+    test — a patch on the already-imported `src.ui.app` module wouldn't reach the running
+    script. `src.voice.tts.load_speaker` IS shared across the re-exec (the module stays in
+    `sys.modules`), and `app.py`'s `_speaker()` re-imports it fresh on every exec via
+    `from src.voice.tts import ... load_speaker`."""
+    fake = _fake_chat_response(
+        "Here's a sturdy boot.",
+        [
+            {
+                "item_id": "B0TEST0003",
+                "name": "Trail Boot",
+                "image_path": None,
+                "product_type": "BOOT",
+                "color": "Black",
+                "material": "Leather",
+                "brand": "Trekker",
+            }
+        ],
+    )
+    fake_audio = b"RIFF....WAVEfmt fake-pcm-bytes"
+    fake_speaker = MagicMock()
+    fake_speaker.synthesize.return_value = fake_audio
+
+    with (
+        patch("httpx.post", return_value=fake),
+        patch("src.voice.tts.load_speaker", lambda *a, **kw: fake_speaker),
+    ):
+        at = AppTest.from_file(_APP_PATH)
+        at.run(timeout=30)
+
+        voice_checkbox = next(c for c in at.checkbox if c.label == "🎙️ Voice mode")
+        voice_checkbox.set_value(True).run(timeout=30)
+        at.chat_input[0].set_value("rugged boots please").run(timeout=30)
+
+    assert not at.exception
+    fake_speaker.synthesize.assert_called_once_with("Here's a sturdy boot.")
+
+    assistant_message = at.session_state["messages"][-1]
+    assert assistant_message["role"] == "assistant"
+    assert assistant_message["audio"] == fake_audio
+
+
 def test_unreachable_backend_surfaces_a_friendly_error_instead_of_crashing():
     import httpx as httpx_module
 

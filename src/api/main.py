@@ -31,6 +31,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from src.agent.graph import ShoppingAgent, build_graph
 from src.agent.llm import load_generator
 from src.agent.memory import load_persistent_memory
+from src.agent.personalize import Personalizer
 from src.api.catalog import ProductCatalog, load_catalog
 from src.api.schemas import ChatRequest, ChatResponse, ErrorDetail, HealthResponse, ProductCard
 from src.common.config import load_config, resolve_path
@@ -38,6 +39,7 @@ from src.common.logging import get_logger
 from src.common.timer import Timer
 from src.embeddings.encode import load_encoder
 from src.index.build import load_collection
+from src.ui.feedback import load_feedback_store
 
 logger = get_logger(__name__)
 
@@ -64,9 +66,19 @@ def _load_real_models() -> RuntimeModels:
     encoder = load_encoder(encoder_model)
     collection = load_collection(encoder_model, "caption_enriched")
     persistent_memory = load_persistent_memory()
+    personalizer = Personalizer(feedback_store=load_feedback_store())
     catalog = load_catalog()
 
-    graph = build_graph(llm, collection, encoder, top_k=cfg["retrieval"]["top_k"])
+    top_k = cfg["retrieval"]["top_k"]
+    graph = build_graph(
+        llm,
+        collection,
+        encoder,
+        personalizer,
+        persistent_memory,
+        top_k=top_k,
+        pool_size=cfg["retrieval"]["personalization_pool_size"],
+    )
     agent = ShoppingAgent(graph=graph, persistent_memory=persistent_memory)
 
     return RuntimeModels(

@@ -20,6 +20,7 @@ from fastapi.testclient import TestClient
 from src.agent.filters import SearchFilters
 from src.agent.graph import ShoppingAgent, build_graph
 from src.agent.memory import PersistentMemory, UserPreferences
+from src.agent.personalize import Personalizer
 from src.api.catalog import ProductCatalog
 from src.api.main import RuntimeModels, create_app
 
@@ -70,7 +71,17 @@ def _fake_collection():
 def _noop_memory() -> PersistentMemory:
     memory = MagicMock(spec=PersistentMemory)
     memory.merge.return_value = UserPreferences()
+    memory.load.return_value = UserPreferences()
     return memory
+
+
+def _passthrough_personalizer() -> Personalizer:
+    """A `Personalizer` stand-in that returns the candidate pool truncated to `top_k`,
+    unchanged — these are API-wiring tests, not personalization tests (that's
+    `tests/test_personalize.py`'s job)."""
+    personalizer = MagicMock(spec=Personalizer)
+    personalizer.rerank.side_effect = lambda candidate_ids, *, top_k, **_kwargs: candidate_ids[:top_k]
+    return personalizer
 
 
 def _make_loader(*, retrieved_ids: list[str], response_text: str = "Here are some great picks!"):
@@ -81,7 +92,9 @@ def _make_loader(*, retrieved_ids: list[str], response_text: str = "Here are som
         llm = _fake_llm(response_text=response_text)
         collection = _fake_collection()
         encoder = MagicMock()
-        graph = build_graph(llm, collection, encoder, top_k=5)
+        graph = build_graph(
+            llm, collection, encoder, _passthrough_personalizer(), _noop_memory(), top_k=5, pool_size=5
+        )
         agent = ShoppingAgent(graph=graph, persistent_memory=_noop_memory())
         return RuntimeModels(
             agent=agent,
@@ -260,7 +273,11 @@ def test_search_parity_between_chat_path_and_offline_search(real_collection_and_
     fake_llm = MagicMock()
     fake_llm.complete_structured.return_value = SearchFilters(rewritten_query=query)
     fake_llm.complete.return_value = "..."
-    graph = build_graph(fake_llm, collection, encoder, top_k=5)
+    # pool_size == top_k -> the personalized pool IS the offline top-5, so an empty-history
+    # passthrough rerank can't perturb the order; this test is about *retrieval* parity.
+    graph = build_graph(
+        fake_llm, collection, encoder, _passthrough_personalizer(), _noop_memory(), top_k=5, pool_size=5
+    )
 
     online_result = graph.invoke({"user_id": "u1", "history": [], "message": query})
 

@@ -27,6 +27,7 @@ from langgraph.graph import END, START, StateGraph
 from src.agent.filters import SearchFilters, extract_filters, filters_to_where
 from src.agent.llm import GeneratorLLM
 from src.agent.memory import ConversationBuffer, PersistentMemory, UserPreferences
+from src.agent.personalize import Personalizer
 from src.common.logging import get_logger
 from src.index.build import search
 
@@ -79,13 +80,44 @@ def _understand_query_node(llm: GeneratorLLM):
     return node
 
 
-def _search_products_node(collection, encoder, *, top_k: int):
+def _metadata_for_ids(collection, item_ids: list[str]) -> dict[str, dict]:
+    if not item_ids:
+        return {}
+    got = collection.get(ids=item_ids, include=["metadatas"])
+    return dict(zip(got["ids"], got["metadatas"]))
+
+
+def _search_products_node(
+    collection,
+    encoder,
+    personalizer: Personalizer,
+    persistent_memory: PersistentMemory,
+    *,
+    top_k: int,
+    pool_size: int,
+):
+    """Retrieve a `pool_size`-deep similarity-ranked candidate pool (deeper than the
+    `top_k` actually shown), then let `Personalizer.rerank` reorder it for this user before
+    truncating to `top_k`. Pulling a deeper pool is what gives personalization something to
+    *work with* — re-ranking only the top 10 of an already-10-deep search couldn't surface
+    a previously-liked item ranked 11th by raw similarity."""
+
     def node(state: AgentState) -> dict:
         filters = state["filters"]
         where = filters_to_where(filters)
-        retrieved_ids = search(collection, encoder, filters.rewritten_query, top_k=top_k, where=where)
+        candidate_ids = search(collection, encoder, filters.rewritten_query, top_k=pool_size, where=where)
+        preferences = persistent_memory.load(state["user_id"])
+        metadata_by_id = _metadata_for_ids(collection, candidate_ids)
+        retrieved_ids = personalizer.rerank(
+            candidate_ids,
+            user_id=state["user_id"],
+            preferences=preferences,
+            metadata_by_id=metadata_by_id,
+            top_k=top_k,
+        )
         logger.info(
-            "Retrieved %d products for query %r (where=%s)",
+            "Retrieved %d candidates, personalized to %d products for query %r (where=%s)",
+            len(candidate_ids),
             len(retrieved_ids),
             filters.rewritten_query,
             where,
@@ -133,11 +165,30 @@ def _describe_products(collection, item_ids: list[str]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def build_graph(llm: GeneratorLLM, collection, encoder, *, top_k: int = 10):
-    """Wire the three nodes into a compiled LangGraph: understand -> search -> generate."""
+def build_graph(
+    llm: GeneratorLLM,
+    collection,
+    encoder,
+    personalizer: Personalizer,
+    persistent_memory: PersistentMemory,
+    *,
+    top_k: int = 10,
+    pool_size: int = 30,
+):
+    """Wire the three nodes into a compiled LangGraph: understand -> search -> generate.
+
+    `pool_size` (default 30, three times `top_k`) is the personalization headroom — see
+    `_search_products_node` docstring for why re-ranking needs a deeper pool than the final
+    shown count to have anything to work with.
+    """
     graph = StateGraph(AgentState)
     graph.add_node("understand_query", _understand_query_node(llm))
-    graph.add_node("search_products", _search_products_node(collection, encoder, top_k=top_k))
+    graph.add_node(
+        "search_products",
+        _search_products_node(
+            collection, encoder, personalizer, persistent_memory, top_k=top_k, pool_size=pool_size
+        ),
+    )
     graph.add_node("generate_response", _generate_response_node(llm, collection))
 
     graph.add_edge(START, "understand_query")

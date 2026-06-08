@@ -42,10 +42,13 @@ httpx==0.27.2
 
 # --- Voice (speech-to-text / text-to-speech) ---
 faster-whisper==1.0.3
-# piper-tts: NOT pip-installable on Python 3.12 / arm64 — `piper-phonemize` ships no wheel for
-# this combo (verified at install time). Piper is normally consumed as a prebuilt binary
-# release, not a Python package. Resolve when voice output is implemented, via the Piper
-# binary release or an alternative local TTS (e.g. Coqui TTS, macOS `say` for dev fallback).
+# piper-tts==1.4.2 ships a real cp39-abi3 arm64 wheel (verified live: `pip install
+# piper-tts==1.4.2` succeeds and `from piper import PiperVoice` imports cleanly). An older
+# project note claimed Piper wasn't pip-installable on Python 3.12/arm64 because
+# `piper-phonemize` shipped no matching wheel — true for the release checked at the time,
+# fixed in this one. Voices (.onnx + .onnx.json) are downloaded separately, once, via
+# `python -m piper.download_voices` — see README "Voice mode" setup.
+piper-tts==1.4.2
 
 # --- Testing / quality ---
 pytest==8.3.3

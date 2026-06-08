@@ -18,6 +18,7 @@ import redis
 from src.agent.filters import SearchFilters
 from src.agent.graph import ShoppingAgent, _describe_products, build_graph
 from src.agent.memory import PersistentMemory, UserPreferences
+from src.agent.personalize import Personalizer
 
 TEST_REDIS_URL = "redis://localhost:6379/15"
 
@@ -45,6 +46,15 @@ def _fake_collection(*, get_return=None):
     collection = MagicMock()
     collection.get.return_value = get_return or {"ids": [], "documents": [], "metadatas": []}
     return collection
+
+
+def _passthrough_personalizer():
+    """A `Personalizer` stand-in that returns the candidate pool truncated to `top_k`,
+    unchanged — for graph-wiring tests that assert on *retrieval*, not personalization
+    (that's `tests/test_personalize.py`'s job)."""
+    personalizer = MagicMock(spec=Personalizer)
+    personalizer.rerank.side_effect = lambda candidate_ids, *, top_k, **_kwargs: candidate_ids[:top_k]
+    return personalizer
 
 
 # ---------------------------------------------------------------------------
@@ -91,14 +101,16 @@ def test_build_graph_runs_understand_then_search_then_generate_in_order():
     encoder = MagicMock()
 
     with patch("src.agent.graph.search", return_value=["P1", "P2"]) as mock_search:
-        graph = build_graph(llm, collection, encoder, top_k=5)
+        graph = build_graph(
+            llm, collection, encoder, _passthrough_personalizer(), _noop_memory(), top_k=5, pool_size=5
+        )
         result = graph.invoke({"user_id": "u1", "history": [], "message": "brown leather chairs?"})
 
     # understand_query ran first and its output drove the search call
     llm.complete_structured.assert_called_once()
     mock_search.assert_called_once()
     _, search_kwargs = mock_search.call_args
-    assert search_kwargs["top_k"] == 5
+    assert search_kwargs["top_k"] == 5  # = pool_size, the candidate-pool depth `search` is asked for
     assert search_kwargs["where"] == {"$and": [{"product_type": "CHAIR"}, {"color": "Brown"}]}
 
     # generate_response ran last and saw the search results
@@ -114,7 +126,7 @@ def test_build_graph_passes_an_unfiltered_search_when_no_attributes_were_extract
     encoder = MagicMock()
 
     with patch("src.agent.graph.search", return_value=[]) as mock_search:
-        graph = build_graph(llm, collection, encoder)
+        graph = build_graph(llm, collection, encoder, _passthrough_personalizer(), _noop_memory())
         graph.invoke({"user_id": "u1", "history": [], "message": "something nice for my kitchen?"})
 
     _, search_kwargs = mock_search.call_args
@@ -138,7 +150,10 @@ def test_shopping_agent_product_ids_are_sourced_from_retrieval_not_from_llm_text
     encoder = MagicMock()
 
     with patch("src.agent.graph.search", return_value=["REAL1", "REAL2"]):
-        agent = ShoppingAgent(graph=build_graph(llm, collection, encoder), persistent_memory=_noop_memory())
+        agent = ShoppingAgent(
+            graph=build_graph(llm, collection, encoder, _passthrough_personalizer(), _noop_memory()),
+            persistent_memory=_noop_memory(),
+        )
         turn = agent.chat(user_id="u1", session_id="s1", message="blue rugs?")
 
     assert turn.product_ids == ["REAL1", "REAL2"]
@@ -152,7 +167,10 @@ def test_shopping_agent_carries_conversation_history_across_turns_in_one_session
     encoder = MagicMock()
 
     with patch("src.agent.graph.search", return_value=[]):
-        agent = ShoppingAgent(graph=build_graph(llm, collection, encoder), persistent_memory=_noop_memory())
+        agent = ShoppingAgent(
+            graph=build_graph(llm, collection, encoder, _passthrough_personalizer(), _noop_memory()),
+            persistent_memory=_noop_memory(),
+        )
         agent.chat(user_id="u1", session_id="s1", message="show me chairs")
         agent.chat(user_id="u1", session_id="s1", message="cheaper ones?")
 
@@ -170,7 +188,10 @@ def test_shopping_agent_keeps_separate_buffers_per_session():
     encoder = MagicMock()
 
     with patch("src.agent.graph.search", return_value=[]):
-        agent = ShoppingAgent(graph=build_graph(llm, collection, encoder), persistent_memory=_noop_memory())
+        agent = ShoppingAgent(
+            graph=build_graph(llm, collection, encoder, _passthrough_personalizer(), _noop_memory()),
+            persistent_memory=_noop_memory(),
+        )
         agent.chat(user_id="u1", session_id="session-A", message="message in session A")
         agent.chat(user_id="u1", session_id="session-B", message="message in session B")
 
@@ -188,7 +209,8 @@ def test_shopping_agent_merges_extracted_color_into_persistent_preferences(persi
 
     with patch("src.agent.graph.search", return_value=[]):
         agent = ShoppingAgent(
-            graph=build_graph(llm, collection, encoder), persistent_memory=persistent_memory
+            graph=build_graph(llm, collection, encoder, _passthrough_personalizer(), persistent_memory),
+            persistent_memory=persistent_memory,
         )
         agent.chat(user_id="user-green", session_id="s1", message="green chairs please")
 
@@ -206,7 +228,8 @@ def test_shopping_agent_persisted_preference_survives_a_fresh_connection(persist
 
     with patch("src.agent.graph.search", return_value=[]):
         agent = ShoppingAgent(
-            graph=build_graph(llm, collection, encoder), persistent_memory=persistent_memory
+            graph=build_graph(llm, collection, encoder, _passthrough_personalizer(), persistent_memory),
+            persistent_memory=persistent_memory,
         )
         agent.chat(user_id="user-pink", session_id="s1", message="pink handbags?")
 
@@ -215,8 +238,10 @@ def test_shopping_agent_persisted_preference_survives_a_fresh_connection(persist
 
 
 def _noop_memory():
-    """A `PersistentMemory` whose `merge` is a no-op — for graph-wiring tests that don't
-    care about the persistence path (keeps them independent of a running Redis)."""
+    """A `PersistentMemory` whose `merge`/`load` are no-ops returning an empty profile —
+    for graph-wiring tests that don't care about the persistence path (keeps them
+    independent of a running Redis)."""
     memory = MagicMock(spec=PersistentMemory)
     memory.merge.return_value = UserPreferences()
+    memory.load.return_value = UserPreferences()
     return memory
