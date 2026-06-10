@@ -15,6 +15,7 @@ import httpx
 import streamlit as st
 
 from src.common.config import load_config, resolve_path
+from src.common.secrets import get_env
 from src.ui.feedback import FeedbackStore, load_feedback_store
 from src.voice.stt import Transcriber, load_transcriber
 from src.voice.tts import Speaker, load_speaker
@@ -29,8 +30,14 @@ _MATERIALS = ["Any", "Leather", "Wood", "Metal", "Plastic", "Fabric", "Cotton", 
 
 
 def _config():
+    """`api_base_url` resolves, in priority order: the `API_BASE_URL` environment variable,
+    then `ui.api_base_url` from config.yaml. The env-var layer is what lets the same image
+    run as a `docker-compose` service (reaching the API by service name, `http://api:8000`)
+    or on a host machine (`http://localhost:8000`) without rebuilding — see
+    `src.agent.memory.load_persistent_memory` for the identical pattern applied to Redis."""
     cfg = load_config()
-    return cfg["ui"]["api_base_url"], cfg["ui"]["title"]
+    api_base_url = get_env("API_BASE_URL") or cfg["ui"]["api_base_url"]
+    return api_base_url, cfg["ui"]["title"]
 
 
 @st.cache_resource

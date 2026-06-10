@@ -1,0 +1,72 @@
+# `docker compose up` brings up the whole ShopTalk stack — Redis, the inference API, and
+# the chat UI — on a clean machine (docs/ShopTalk_Plan.md §11 exit gate). The SAME image
+# (built once from ./Dockerfile) backs both the `api` and `ui` services; only `command:`
+# differs — exactly mirroring how the project runs the two as separate local processes.
+#
+# Model artifacts (Chroma index, HF model cache, Piper voices, the feedback DB) are bind-
+# mounted from the host's `data/`/`weights/`, never baked into the image — see Dockerfile
+# for why. Build them locally first (the offline pipeline — README "Local setup") or pull
+# the parquet/index artifacts back from a Kaggle run before `up`.
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: ["redis-server", "--appendonly", "yes"] # persist UserPreferences across container restarts
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build: .
+    command: ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # Override config.yaml's "redis://localhost:6379/0" — inside compose's network, Redis
+      # is reachable by SERVICE NAME, not "localhost" (see src.agent.memory.load_persistent_memory
+      # docstring for the full "one image, three runtime addresses" rationale).
+      REDIS_URL: "redis://redis:6379/0"
+      # HF_HOME / TRANSFORMERS_CACHE: keep downloaded model weights in the mounted `weights/`
+      # volume, not the container's writable layer — survives `docker compose down`.
+      HF_HOME: "/app/weights/huggingface"
+    volumes:
+      - ./data:/app/data
+      - ./weights:/app/weights
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s # first request triggers a one-time ~15-20s model-loading lifespan
+
+  ui:
+    build: .
+    command: ["streamlit", "run", "src/ui/app.py", "--server.address=0.0.0.0", "--server.port=8501"]
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    environment:
+      # Override config.yaml's "http://localhost:8000" — inside compose's network, the API
+      # is reachable as `http://api:8000` (its service name). See src.ui.app._config docstring.
+      API_BASE_URL: "http://api:8000"
+    volumes:
+      - ./data:/app/data
+      - ./weights:/app/weights
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  redis-data:

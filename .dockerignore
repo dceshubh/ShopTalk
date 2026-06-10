@@ -1,0 +1,32 @@
+# Keep the build context small and the image free of dev-only / large / secret artifacts —
+# mirrors .gitignore's "data & model artifacts never committed" stance, applied to images.
+
+.git/
+.venv-shoptalk/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.claude/
+
+# Data, weights, indices — mounted as volumes at runtime (see docker-compose.yml), never baked in
+data/
+weights/
+*.parquet
+*.tar
+*.tar.gz
+chroma_db/
+
+# Notebooks, docs, tests — dev/eval-time, not serving-time
+notebooks/
+docs/
+tests/
+.ipynb_checkpoints/
+
+# Secrets — passed via docker-compose's env_file, never copied into the image
+.env
+*.key
+
+.vscode/
+.DS_Store

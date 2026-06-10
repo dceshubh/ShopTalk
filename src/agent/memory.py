@@ -21,6 +21,7 @@ from pydantic import BaseModel
 
 from src.common.config import load_config
 from src.common.logging import get_logger
+from src.common.secrets import get_env
 
 logger = get_logger(__name__)
 
@@ -115,9 +116,16 @@ class PersistentMemory:
 
 
 def load_persistent_memory(redis_url: str | None = None) -> PersistentMemory:
-    """Connect to Redis using `agent.memory.redis_url` from config.yaml unless overridden.
+    """Connect to Redis at, in priority order: an explicit `redis_url` argument, the
+    `REDIS_URL` environment variable, then `agent.memory.redis_url` from config.yaml.
+
+    The env-var layer exists for containerized deployment: `redis://localhost:6379/0` is
+    correct for local dev (Redis runs on the host), but inside `docker-compose` the same
+    image must reach Redis by its *service name* (`redis://redis:6379/0`) — a value that
+    can't be baked into `config.yaml` without breaking local dev. One image, three runtime
+    addresses (local / compose / AWS), selected entirely at deploy time via `.env`/`-e`.
     `decode_responses=True` so `.get()` returns `str` (matching `model_validate_json`'s
     expected input) rather than raw `bytes`."""
-    redis_url = redis_url or load_config()["agent"]["memory"]["redis_url"]
+    redis_url = redis_url or get_env("REDIS_URL") or load_config()["agent"]["memory"]["redis_url"]
     logger.info("Connecting persistent agent memory to Redis at %s", redis_url)
     return PersistentMemory(redis_client=redis.from_url(redis_url, decode_responses=True))

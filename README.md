@@ -117,8 +117,9 @@ lifecycle:
    lived in.
 3. **AWS (forward-looking)** — the only step that genuinely needs paid cloud compute: an
    official, reproducible P95/P99 latency benchmark of the fully-assembled service on a
-   `g4dn.xlarge` GPU instance, plus a containerized deployment. Not yet built — see
-   [AWS deployment](#3-aws-cloud-forward-looking) below for the planned shape of it.
+   `g4dn.xlarge` GPU instance. The container it deploys is already built and runnable — see
+   [Containerized deployment](#3-containerized-deployment-docker--aws) below for the real
+   `docker compose` commands and the runbook for the live deploy.
 
 `docs/ShopTalk_Plan.md` §8 ("Compute & cost strategy") captures the reasoning behind this
 split in full — in short: **local-first, two short free-GPU bursts, one short paid AWS
@@ -200,6 +201,37 @@ or sampled data — `pytest -q` exercises the wiring of every stage without need
 
 The API and UI are two separate processes that talk over HTTP — exactly the shape the final
 deployment takes, so "it works in dev" and "it works deployed" are the same claim.
+
+**The one-command way — `scripts/shoptalk.sh`** (recommended; handles every starting state):
+
+```bash
+./scripts/shoptalk.sh          # (re)start: stops any stale ShopTalk processes, makes sure
+                               #   Redis is running, boots the API + UI fresh in the
+                               #   background. Run this whether nothing is running yet,
+                               #   it's already running, or a previous run crashed and left
+                               #   stale processes — all converge to the same clean state.
+./scripts/shoptalk.sh status   # what's running right now, and the URLs to open
+./scripts/shoptalk.sh down     # stop the API + UI — frees the ~2-3 GB of loaded models
+                               #   (Groq client, bge-base-en-v1.5 encoder, Chroma index,
+                               #   Whisper, Piper) when you're not actively using the app.
+                               #   Redis is left running (it's lightweight, ~1 MB resident).
+```
+
+It logs to `/tmp/shoptalk_{api,ui}.log` (`tail -f` them to watch the ~15-20s model-loading
+boot) and prints the URLs once both processes are launched:
+
+- **API:** `http://localhost:8000/health`
+- **UI:** `http://localhost:8501`
+
+> **Port collisions:** the script identifies ShopTalk's own processes by full command line
+> (scoped to the `.venv-shoptalk` path) — never by port — so it can never kill an unrelated
+> project's server by mistake. It *can't*, however, fix a case where another project is
+> already bound to `:8000` or `:8501`: if `http://localhost:8000/health` doesn't respond
+> the way `docs/PROJECT_REPORT.md` §6.1 describes, run `lsof -nP -iTCP:8000 -sTCP:LISTEN`
+> to see what's actually listening there, and either stop that other process or change
+> `configs/config.yaml: api.port` / run Streamlit with `--server.port`.
+
+**The manual way** (two terminals — useful for watching each process's logs directly):
 
 ```bash
 # Terminal 1 — the inference API (loads all models ONCE at startup; ~15-20s cold start)
@@ -299,34 +331,121 @@ The same shape applies to fine-tuning: attach the mined hard-negative triplets
 base encoder as inputs, run the LoRA training loop from `configs/config.yaml: finetune`
 against a free T4, and pull the resulting adapter weights back into `weights/`.
 
-### 3. AWS cloud (forward-looking)
+### 3. Containerized deployment (Docker → AWS)
 
-**Not yet built.** This is the only stage of the project that needs paid compute, and it's
-deliberately scoped to a short, well-defined window at the end rather than something the
-project lives in day-to-day. The plan (`docs/ShopTalk_Plan.md` §7-§8):
+**The container is built and runnable; the live AWS deployment is the one remaining step**
+(it needs an AWS account and a provisioned GPU instance — see "What's left for you to do"
+below). The container is what makes "runs on my Mac," "runs via `docker compose`," and
+"runs on an AWS g4dn box" the *same artifact* — not three configurations that can drift
+apart — via the `REDIS_URL`/`API_BASE_URL` runtime overrides described in
+`docs/PROJECT_REPORT.md` §8.
 
-- **Target instance:** `g4dn.xlarge` (1× T4, 16 GB VRAM / 16 GB host RAM) — named directly
-  in the assignment brief. Estimated inference-time footprint: a 4-bit ~7B local LLM
-  (~5-6 GB VRAM) + the embedding encoder (~0.5 GB) + an optional cross-encoder reranker
-  (~0.5 GB) + Whisper-small (~1 GB) ≈ 7-8 GB VRAM — fits with headroom. (Note: the *deployed*
-  generator may differ from the dev-time Groq-hosted one — see `docs/PROJECT_REPORT.md` §5.1
-  for why Groq was chosen for local dev, and why that choice is orthogonal to what runs on
-  the GPU box.)
-- **Cost:** ~$0.526/hr on-demand, ~$0.16/hr spot. A focused 4-8 hour window — enough to
-  build the container, deploy, run the official P95/P99 latency benchmark, and capture
-  evidence — comes to roughly **$2-4 on-demand, or under $1.50 on spot**. AWS's free tier
-  has no GPU instances, so this is the one genuinely-paid step in the whole project.
-- **Packaging:** a multi-stage Dockerfile plus `docker-compose` wiring the API, Redis, and
-  (if used) a locally-hosted generator together — so "runs on my Mac" and "runs on the GPU
-  box" are the same artifact, not two configurations that can drift apart.
-- **What gets measured there:** the official P95/P99 end-to-end latency numbers
-  (`docs/ShopTalk_Plan.md` §7) — captured on the *actual target hardware* the rubric names,
-  not extrapolated from a dev laptop. Everything else (correctness suites, the dev-scale
-  latency harness, the live demo) is designed to already be true before this window opens —
-  the AWS step exists to *prove* it on the named hardware, not to discover whether it works.
+#### Run the whole stack with Docker, locally
 
-This section will be filled in with real commands, a Dockerfile, and live-measured numbers
-once that stage is built — see `docs/ShopTalk_Plan.md` for the up-to-date staged build order.
+This is the fastest way to prove "reproducible container, clean machine" before paying for
+any cloud compute — and the *exact same* `docker compose up` is what the AWS runbook below
+runs on the g4dn box.
+
+**Prerequisites:** [Docker Desktop](https://www.docker.com/products/docker-desktop/)
+(includes Compose v2), the dataset/index already built locally (`data/`, `weights/` —
+see "Local setup" above; these are bind-mounted into the containers, not baked into the
+image), and a filled-in `.env`.
+
+```bash
+# Build the image once (subsequent `up`s reuse the cached layers — only the final COPY
+# layers rebuild when src/ changes)
+docker compose build
+
+# Bring up Redis -> API -> UI, in that dependency order (docker-compose.yml's
+# `depends_on: condition: service_healthy` gates each service on the previous one's
+# healthcheck — Redis must answer PING before the API starts; the API must answer
+# /health before the UI starts)
+docker compose up
+
+# ...or detached, with logs on demand:
+docker compose up -d
+docker compose logs -f api ui
+```
+
+Open `http://localhost:8501` — identical experience to the local two-process run, because
+it's the identical code behind it. Tear down with `docker compose down` (add `-v` to also
+drop the named `redis-data` volume — preserved Redis persistence — if you want a truly
+clean slate).
+
+> **Not yet run end-to-end on this machine** — it has no Docker daemon installed. The
+> `Dockerfile`/`docker-compose.yml`/`.dockerignore` are written, the image's dependency
+> resolution matches the pinned `requirements.txt` exactly, and the runtime wiring
+> (env-var address overrides, healthcheck-gated startup order, volume mounts) is unit-
+> tested at the code level (`tests/test_memory.py::test_load_persistent_memory_*`,
+> `tests/test_ui_app.py::test_config_*`) — but the literal `docker build && docker compose
+> up` hasn't been run by me. That's first on the "what's left for you" list.
+
+#### Deploying to AWS g4dn.xlarge (the runbook this will follow)
+
+`g4dn.xlarge` (1× T4, 16 GB VRAM / 16 GB host RAM) is named directly in the assignment
+brief. Estimated inference-time footprint there, summed across a 4-bit ~7B local LLM
+(~5-6 GB VRAM, if you swap off the dev-time Groq-hosted generator — see
+`docs/PROJECT_REPORT.md` §5.1 for why Groq was chosen for local dev and why that choice is
+orthogonal to what runs on the GPU box), the embedding encoder (~0.5 GB), an optional
+cross-encoder reranker (~0.5 GB), and Whisper-small (~1 GB): roughly 7-8 GB VRAM — fits
+with headroom.
+
+```bash
+# On the g4dn instance (Deep Learning AMI — ships with NVIDIA drivers + Docker + the
+# NVIDIA Container Toolkit preinstalled, so `docker compose` can already see the GPU):
+
+git clone https://github.com/dceshubh/ShopTalk.git && cd ShopTalk
+cp .env.example .env   # fill in GROQ_API_KEY (or point the generator at a local model)
+
+# Pull the prebuilt index/model artifacts onto the box — e.g. `aws s3 cp --recursive
+# s3://<your-bucket>/shoptalk-artifacts/{data,weights} ./{data,weights}/` — rather than
+# rebuilding the whole offline pipeline on a billed-by-the-hour GPU instance.
+
+docker compose up -d
+curl http://localhost:8000/health   # smoke test: load_count == 1, all models reported
+```
+
+Then: open a security-group rule for `8501` (UI) — and `8000` if you want direct API
+access — point a browser at `http://<instance-public-ip>:8501`, run the conversational +
+voice smoke test end-to-end, and capture the official P95/P99 numbers (§7) by pointing the
+existing latency harness at the live `/chat` endpoint instead of an in-process call.
+
+**Cost:** ~$0.526/hr on-demand, ~$0.16/hr spot. A focused 4-8 hour window — provision,
+deploy, smoke-test, capture P95/P99 evidence, tear down — comes to roughly **$2-4
+on-demand, or under $1.50 on spot**. AWS's free tier has no GPU instances, so this is the
+one genuinely-paid step in the whole project (`docs/ShopTalk_Plan.md` §8 has the full
+local-first cost-strategy reasoning). **Stop or terminate the instance the moment you're
+done** — a forgotten g4dn left running is the single most common way this kind of project
+quietly burns $15-20+ overnight.
+
+**HF Spaces fallback** (§2.7 of the plan): if AWS access is a blocker, a *trimmed* config —
+hosted-LLM API (Groq, as in dev) instead of a local model, in-memory session state instead
+of Redis — can run on HF Spaces' free CPU tier as a lightweight demo. Treat it as a backup
+demo surface, not a parity deployment; the rubric names g4dn specifically, and that's what
+the official P95/P99 numbers need to come from.
+
+#### What's left for you to do
+
+Everything above this line is built, tested, and (where the hardware allows) live-verified.
+What remains needs things only you can provide — an AWS account, billing, and a Docker
+daemon on this machine:
+
+1. **Install Docker Desktop** on this Mac (or any machine with one) and run
+   `docker compose build && docker compose up` — the one exit gate ("brings up the whole
+   stack on a clean machine") that needs an actual Docker daemon to prove, not just inspect.
+2. **An AWS account with billing enabled**, and either an access key pair or
+   `aws configure sso` set up for the CLI/console — I can't create or fund this for you.
+3. **Provision the `g4dn.xlarge` instance** (on-demand or spot — spot is ~3x cheaper and
+   fine for a few-hour smoke-test window; just expect possible interruption), using a Deep
+   Learning AMI so the NVIDIA driver/Container Toolkit story is solved for you.
+4. **Open the security-group ports** (`8501`, optionally `8000`) to your IP — not `0.0.0.0/0`.
+5. **Run the deploy runbook above**, smoke-test the live endpoint (including a voice-mode
+   round trip), and capture the official P95/P99 latency numbers for §7 / the rubric.
+6. **Stop/terminate the instance** the moment you're done capturing evidence — this is the
+   step most likely to silently cost real money if forgotten.
+7. *(Optional)* if you'd rather not spend anything, the HF Spaces fallback above needs a
+   free Hugging Face account and a `git push` to a Space repo — zero AWS required, at the
+   cost of not being "on the named target hardware" for the latency numbers.
 
 ---
 

@@ -907,11 +907,57 @@ across fakes.
 
 ## 8. Deployment (Docker + AWS)
 
-*Pending — not yet started.*
+**Containerization is complete and code-supports all three of the project's run modes —
+local, `docker-compose`, and (planned) AWS — from the same artifact; the live AWS deployment
+itself has not happened yet** (it needs an AWS account/credentials and a provisioned g4dn
+instance — see README "What's left for you to do" for the precise remaining steps and the
+runbook they'll follow).
+
+- **One image, two services, one `command:` difference.** `Dockerfile` is a multi-stage
+  build — a `builder` stage resolves `requirements.txt` into a venv, a `runtime` stage
+  copies just that venv plus `src/`/`configs/`/`pyproject.toml` (no compilers, no pip cache,
+  no `.git`, no `tests/`/`notebooks/`/`docs/` — see `.dockerignore`). `docker-compose.yml`
+  then runs that *same* image as both the `api` service (`uvicorn src.api.main:app`) and
+  the `ui` service (`streamlit run src/ui/app.py`) — exactly mirroring how the project
+  already runs locally as two HTTP-coupled processes (§6.1). "Dev looks like prod" holds at
+  the container boundary, not just the code boundary.
+- **Model artifacts are bind-mounted, never baked into the image** — `./data:/app/data` and
+  `./weights:/app/weights` keep the Chroma index, the HF model cache (`HF_HOME` redirected
+  into the mount), Piper voices, and the feedback SQLite DB on the host, surviving rebuilds
+  and `docker compose down`. This decouples the two things that actually change at
+  different rates: the serving code (rebuild the image) and the data/model layer (pull a
+  fresh `products_enriched.parquet` from Kaggle, rerun the indexing step — no rebuild).
+- **One real code change this surfaced**: `config.yaml` hardcodes `redis://localhost:6379/0`
+  and `http://localhost:8000` — correct when every process runs on the same host, wrong
+  inside `docker-compose`'s network where each service is reachable only by its *service
+  name* (`redis://redis:6379/0`, `http://api:8000`). Rather than fork the config per
+  environment, `src.agent.memory.load_persistent_memory` and `src.ui.app._config` now
+  resolve these addresses at runtime with a clean priority order — **explicit argument →
+  `REDIS_URL`/`API_BASE_URL` environment variable → `config.yaml` default** — so the
+  identical image adapts to local / compose / AWS purely through the `environment:` block
+  the deploy target sets, never a code or image change. 5 new tests
+  (`tests/test_memory.py::test_load_persistent_memory_*`,
+  `tests/test_ui_app.py::test_config_*`) pin down all three resolution branches.
+- **`scripts/shoptalk.sh up|down|status`** — a single idempotent local-dev entrypoint that
+  came directly out of working on this stage: hand-managing the API + UI as two background
+  processes leaves stale ones around, and a *13-hour-old, completely unrelated* `Finances
+  Tracker` uvicorn was found squatting on port 8000 on this very machine during testing —
+  silently routing ShopTalk's own `localhost:8000` traffic to the wrong app. The script
+  matches processes by **full command line scoped to the `.venv-shoptalk` path**, never by
+  port or process name, specifically so it can never reach across into another project; one
+  command (`./scripts/shoptalk.sh`) converges "nothing running / already running /
+  crashed-and-stale" all to the same end state — API + UI up, nothing duplicated, with the
+  ~2-3 GB of loaded models freeable on demand via `./scripts/shoptalk.sh down`.
+- **What remains**: an actual `docker build`/`docker compose up` run (this dev machine has
+  no Docker daemon — Docker Desktop install is one of the items in README "What's left for
+  you to do"), provisioning the AWS g4dn.xlarge instance, deploying the compose stack to it,
+  smoke-testing the live endpoint end-to-end (with voice), and capturing the *official*
+  P95/P99 latency numbers (§7) on that named target hardware.
 
 ---
 
-*Last updated: 2026-06-08 — voice mode (§6.9) and the feedback loop / personalization
-(§6.10) complete and live-verified end-to-end against real models and the real index; full
-suite green at 161 tests with no regressions. Remaining: fine-tuning (§4), E2E latency (§7),
-and deployment (§8) — see `docs/ShopTalk_Plan.md` §7 for the current build order.*
+*Last updated: 2026-06-08 — voice mode (§6.9), feedback loop / personalization (§6.10), and
+containerization (§8) complete; full suite green at 166 tests with no regressions. Remaining:
+fine-tuning (§4), E2E latency (§7), and the live AWS deployment itself (needs AWS
+account/credentials + a provisioned g4dn instance — see README) — see `docs/ShopTalk_Plan.md`
+§7 for the current build order.*

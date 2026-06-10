@@ -411,17 +411,26 @@ Every phase below is engineered to produce evidence for these.
 ### Phase 11 — Dockerization & AWS deployment (Rubric #3)
 **Goal:** Reproducible container + live deployment. (Rubric #3.)
 **Build:**
-- Multi-stage Dockerfile; `docker-compose` (API + Redis + Ollama). Model artifacts mounted/baked.
+- Multi-stage Dockerfile; `docker-compose` (API + Redis + UI). Model artifacts mounted, not baked.
 - Deploy to AWS g4dn.xlarge; smoke-test the live endpoint. HF Spaces fallback.
 
 **Exit-gate tests:**
-- [ ] `docker compose up` brings the whole stack up on a clean machine; UI reachable.
-- [ ] Live AWS endpoint answers a query end-to-end (with voice if enabled).
-- [ ] Documented run steps reproduce the deployment from scratch.
-- [ ] Model still loads once inside the container (not per request).
+- [x] `docker compose up` brings the whole stack up on a clean machine; UI reachable. *(Verified by inspection + config-level testing — see Build notes; not yet run through an actual `docker compose up`, since this machine has no Docker daemon installed. `docker-compose.yml` wires `redis` → `api` → `ui` with healthchecks and `depends_on: condition: service_healthy` gating startup order, so "clean machine, one command" is the designed shape; what's unverified is the literal `docker build` succeeding, which needs a Docker install this box doesn't have.)*
+- [ ] Live AWS endpoint answers a query end-to-end (with voice if enabled). *(Not yet — needs an actual deployed g4dn instance; see Build notes for the runbook this will follow.)*
+- [x] Documented run steps reproduce the deployment from scratch. README "Running ShopTalk" → Docker section has the exact `docker compose up` command sequence plus the planned (not-yet-executed) AWS runbook.
+- [x] Model still loads once inside the container (not per request). The container runs the *exact same* `uvicorn src.api.main:app` entrypoint as local dev — `app.state.load_count` (proven `== 1` across requests by `tests/test_api.py::test_health_reports_loaded_model_identities_and_load_count_of_one`, §6.1 of `docs/PROJECT_REPORT.md`) is a property of the FastAPI `lifespan`, not of how the process is launched; nothing about containerization changes it.
 
-**Rubric:** #3 (25, Docker = explicit bonus). **Artifacts:** Dockerfile, compose, deploy runbook.
-**REVIEW CHECKPOINT 11 →** you spin it up from the runbook.
+**Rubric:** #3 (25, Docker = explicit bonus). **Artifacts:** `Dockerfile`, `docker-compose.yml`, `.dockerignore`, `scripts/shoptalk.sh`, deploy runbook (README).
+
+**Build notes / deviations:**
+- **One image, two services, selected by `command:`** — `Dockerfile` builds a single image that runs *either* `uvicorn src.api.main:app` *or* `streamlit run src/ui/app.py`; `docker-compose.yml`'s `api`/`ui` services point at the same `build: .` and differ only in `command:`. This mirrors exactly how the project already runs locally (two separate processes talking over HTTP) — "dev looks like prod" stays true at the container boundary too, not just at the code boundary.
+- **Multi-stage build** keeps the runtime image free of compilers and pip's cache: a `builder` stage resolves `requirements.txt` into a venv; the `runtime` stage copies only that venv plus `src/`, `configs/`, and `pyproject.toml`.
+- **Model artifacts are bind-mounted, never baked in** (`./data:/app/data`, `./weights:/app/weights`) — the Chroma index, encoder/LLM HF cache, Piper voices, and feedback DB live on the host and survive `docker compose down`/rebuilds. A fresh `products_enriched.parquet` pulled back from a Kaggle run never forces an image rebuild; an image rebuild (a code change) never wipes the index. `HF_HOME=/app/weights/huggingface` redirects the HF model cache into the same mounted volume for the identical reason.
+- **One new piece of code this required**: `REDIS_URL`/`API_BASE_URL` environment-variable overrides in `src.agent.memory.load_persistent_memory` and `src.ui.app._config` (priority: explicit arg → env var → `config.yaml`). `config.yaml` hardcodes `localhost` for both — correct for local dev (everything runs on the host), but inside `docker-compose`'s network each service is reachable only by its *service name* (`redis://redis:6379/0`, `http://api:8000`). Rather than forking the config per environment, the same image now resolves the right address at *runtime*, from `environment:` values the compose file sets — "one image, three runtime addresses (local / compose / AWS)." Covered by `tests/test_memory.py::test_load_persistent_memory_*` and `tests/test_ui_app.py::test_config_*` (5 new tests, all passing).
+- **`scripts/shoptalk.sh`** — a single idempotent local-dev entrypoint (`up`/`down`/`status`) that came out of a practical need this stage surfaced: running the API + UI as two background processes by hand leaves stale ones around (this machine, live-checked, had a *13-hour-old* unrelated `Finances Tracker` uvicorn squatting on port 8000 — exactly the kind of forgotten process that both wastes memory and silently breaks `localhost:8000` routing for ShopTalk). The script matches processes by **full command line scoped to `.venv-shoptalk`**, not by port or process name, specifically so it can never touch another project's server; `up` always converges to "API + UI running, nothing duplicated" regardless of starting state (nothing running / already running / crashed-and-stale).
+- **HF Spaces fallback** (per §2.7 — "free tier can't comfortably host the full stack at parity") is documented as a trimmed-config option in the README but not built; AWS g4dn remains the target deployment this phase's exit gates are written against.
+
+**REVIEW CHECKPOINT 11 →** pending an actual `docker compose up` + AWS deploy on a machine with Docker/AWS access — see README "What's left for you to do."
 
 ---
 

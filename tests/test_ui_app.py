@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, patch
 
 from streamlit.testing.v1 import AppTest
 
-from src.ui.app import _apply_sidebar_filters
+from src.ui.app import _apply_sidebar_filters, _config
 from src.ui.feedback import load_feedback_store
 
 _APP_PATH = "src/ui/app.py"
@@ -47,6 +47,30 @@ def test_apply_sidebar_filters_folds_non_any_picks_into_the_message_text():
     assert "CHAIR" in out
     assert "Brown" in out
     assert "Any" not in out
+
+
+# ---------------------------------------------------------------------------
+# _config — API_BASE_URL env override (the same "one image, three runtime addresses"
+# pattern as src.agent.memory.load_persistent_memory's REDIS_URL override: lets the
+# identical container reach the API by service name in docker-compose, or by host in AWS,
+# without rebuilding).
+# ---------------------------------------------------------------------------
+
+
+def test_config_prefers_the_api_base_url_env_var_over_the_yaml_default(monkeypatch):
+    monkeypatch.setenv("API_BASE_URL", "http://api:8000")
+
+    api_base_url, _title = _config()
+
+    assert api_base_url == "http://api:8000"
+
+
+def test_config_falls_back_to_the_yaml_default_when_the_env_var_is_unset(monkeypatch):
+    monkeypatch.delenv("API_BASE_URL", raising=False)
+
+    api_base_url, _title = _config()
+
+    assert api_base_url == "http://localhost:8000"  # configs/config.yaml: ui.api_base_url
 
 
 # ---------------------------------------------------------------------------

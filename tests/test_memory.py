@@ -14,7 +14,7 @@ from __future__ import annotations
 import pytest
 import redis
 
-from src.agent.memory import ConversationBuffer, PersistentMemory, UserPreferences
+from src.agent.memory import ConversationBuffer, PersistentMemory, UserPreferences, load_persistent_memory
 
 TEST_REDIS_URL = "redis://localhost:6379/15"
 
@@ -123,3 +123,37 @@ def test_merge_overwrites_a_field_when_the_new_turn_provides_a_newer_value(memor
     merged = memory.merge("user-4", UserPreferences(budget_ceiling=75.0))
 
     assert merged.budget_ceiling == 75.0
+
+
+# ---------------------------------------------------------------------------
+# load_persistent_memory — URL resolution priority (explicit arg > REDIS_URL env > config)
+#
+# This priority is what lets the SAME container image run as local dev (Redis on
+# localhost), inside docker-compose (Redis reached by service name), and on AWS — see
+# the function's docstring for the full "one image, three runtime addresses" rationale.
+# ---------------------------------------------------------------------------
+
+
+def test_load_persistent_memory_prefers_an_explicit_url_over_everything(monkeypatch):
+    monkeypatch.setenv("REDIS_URL", "redis://from-env:6379/0")
+
+    memory = load_persistent_memory("redis://explicit:6379/0")
+
+    assert memory.redis_client.connection_pool.connection_kwargs["host"] == "explicit"
+
+
+def test_load_persistent_memory_falls_back_to_the_redis_url_env_var(monkeypatch):
+    monkeypatch.setenv("REDIS_URL", "redis://from-env:6379/0")
+
+    memory = load_persistent_memory()
+
+    assert memory.redis_client.connection_pool.connection_kwargs["host"] == "from-env"
+
+
+def test_load_persistent_memory_falls_back_to_config_when_nothing_else_is_set(monkeypatch):
+    monkeypatch.delenv("REDIS_URL", raising=False)
+
+    memory = load_persistent_memory()
+
+    # configs/config.yaml: agent.memory.redis_url -> "redis://localhost:6379/0"
+    assert memory.redis_client.connection_pool.connection_kwargs["host"] == "localhost"
