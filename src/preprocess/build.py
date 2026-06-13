@@ -72,6 +72,10 @@ def build_canonical_dataframe(raw_dir: Path | str) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     english_typed = len(df)
 
+    if df.empty:
+        logger.info("Canonical catalog: 0 / %d raw records kept as English+typed", total)
+        return df
+
     df = df[df["image_path"].notna()].reset_index(drop=True)
     with_image = len(df)
 

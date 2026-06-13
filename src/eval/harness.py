@@ -118,6 +118,9 @@ def evaluate(
     Retrieves `top_k = max(k_values)` once per query and slices it for every smaller `k` —
     one ANN search per query, not one per (query, k) pair.
     """
+    if not cases:
+        return {}
+
     top_k = max(k_values)
     per_case: list[dict[str, float]] = []
 

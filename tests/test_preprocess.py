@@ -5,9 +5,13 @@ src/preprocess/clean.py: multi-language fields, missing color/material/bullets, 
 unicode punctuation, and keyword de-duplication. Also covers the capped-stratified sampler.
 """
 
+import gzip
+import json
+
 import pandas as pd
 import pytest
 
+from src.preprocess.build import build_canonical_dataframe
 from src.preprocess.clean import (
     build_canonical_product,
     build_doc_text,
@@ -85,6 +89,11 @@ def test_pick_color_handles_missing_standardized_values():
 
 def test_pick_color_handles_missing_field():
     assert pick_color(None) == (None, None)
+
+
+def test_pick_color_falls_back_to_any_english_locale():
+    entries = [{"language_tag": "en_NZ", "value": "Taupe", "standardized_values": ["Brown"]}]
+    assert pick_color(entries) == ("Taupe", "Brown")
 
 
 # ---------------------------------------------------------------------------
@@ -294,3 +303,36 @@ def test_capped_stratified_sample_respects_various_caps(max_fraction):
     sampled = capped_stratified_sample(df, target_size=1000, max_category_fraction=max_fraction, seed=3)
     cap = int(max_fraction * 1000)
     assert (sampled["product_type"] == "DOMINANT").sum() <= cap
+
+
+def test_capped_stratified_sample_returns_empty_for_zero_target_size():
+    # target_size=0 -> every category's cap rounds to 0, so the allocation is empty.
+    # pd.concat([]) on that empty list of parts would raise; assert an empty result instead.
+    df = _category_df({"A": 10, "B": 10})
+    sampled = capped_stratified_sample(df, target_size=0, seed=1)
+    assert len(sampled) == 0
+    assert list(sampled.columns) == list(df.columns)
+
+
+# ---------------------------------------------------------------------------
+# build_canonical_dataframe — empty-catalog edge case
+# ---------------------------------------------------------------------------
+
+
+def test_build_canonical_dataframe_returns_empty_df_when_every_record_is_filtered_out(tmp_path):
+    # Every raw record is non-English, so build_canonical_product returns None for all of
+    # them, leaving rows == [] and pd.DataFrame([]) with no columns. Asserts this no longer
+    # raises KeyError: 'image_path' and instead returns an empty DataFrame.
+    images_dir = tmp_path / "images" / "metadata"
+    images_dir.mkdir(parents=True)
+    (images_dir / "images.csv").write_text("image_id,height,width,path\n")
+
+    listings_dir = tmp_path / "listings" / "metadata"
+    listings_dir.mkdir(parents=True)
+    record = _english_record(item_name=[{"language_tag": "de_DE", "value": "Couchtisch"}])
+    with gzip.open(listings_dir / "listings_0.json.gz", "wt", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+
+    df = build_canonical_dataframe(tmp_path)
+
+    assert df.empty

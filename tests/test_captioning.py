@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pandas as pd
 import pytest
 
@@ -58,6 +59,33 @@ def test_ensure_images_cached_resolves_every_path_and_reuses_the_cache(tmp_path)
     # The repeated "a/1.jpg" hits the on-disk cache fetch_image just populated — one GET
     # per *unique* path, even though the helper doesn't dedupe its input list itself.
     assert mock_get.call_count == 2
+
+
+def test_ensure_images_cached_skips_a_failed_download_without_aborting_the_batch(tmp_path):
+    mock_response = MagicMock(content=b"x")
+    mock_response.raise_for_status.return_value = None
+
+    def _get(url, **kwargs):
+        if "bad" in url:
+            raise httpx.HTTPError("404 Not Found")
+        return mock_response
+
+    with patch("src.captioning.images.httpx.get", side_effect=_get):
+        resolved = ensure_images_cached(["a/good1.jpg", "b/bad.jpg", "c/good2.jpg"], tmp_path)
+
+    assert set(resolved) == {"a/good1.jpg", "c/good2.jpg"}
+
+
+def test_fetch_image_writes_atomically_leaving_no_temp_file_on_success(tmp_path):
+    mock_response = MagicMock(content=b"downloaded-bytes")
+    mock_response.raise_for_status.return_value = None
+
+    with patch("src.captioning.images.httpx.get", return_value=mock_response):
+        result = fetch_image("cd/def456.jpg", tmp_path)
+
+    assert result.read_bytes() == b"downloaded-bytes"
+    leftover = [p for p in result.parent.iterdir() if p != result]
+    assert leftover == []
 
 
 # ---------------------------------------------------------------------------

@@ -115,6 +115,15 @@ def pick_color(color_entries: list[dict[str, Any]] | None) -> tuple[str | None, 
                 standardized = clean_text(std_values[0]) if std_values else None
                 return display, standardized
 
+    # Fall back to any other en_*-tagged entry, matching pick_localized's behavior.
+    for entry in color_entries:
+        tag = entry.get("language_tag", "")
+        if tag.startswith("en"):
+            display = clean_text(entry.get("value"))
+            std_values = entry.get("standardized_values") or []
+            standardized = clean_text(std_values[0]) if std_values else None
+            return display, standardized
+
     return None, None
 
 

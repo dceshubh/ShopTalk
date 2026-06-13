@@ -139,6 +139,14 @@ def test_evaluate_averages_metrics_across_cases_and_runs_one_search_per_query():
     assert metrics["recall_at_3"] == pytest.approx((1.0 + 0.0) / 2)
 
 
+def test_evaluate_returns_empty_dict_for_no_cases_without_calling_search():
+    with patch("src.eval.harness.search") as mock_search:
+        metrics = evaluate(MagicMock(), MagicMock(), [], k_values=[1, 5, 10])
+
+    mock_search.assert_not_called()
+    assert metrics == {}
+
+
 def test_evaluate_requests_top_k_equal_to_the_largest_k_value_only_once_per_query():
     cases = [GoldenCase("query", frozenset({"A"}), "easy")]
     with patch("src.eval.harness.search", return_value=["A"]) as mock_search:

@@ -72,6 +72,9 @@ def capped_stratified_sample(
         if n > 0:
             parts.append(df[df[category_col] == category].sample(n=n, random_state=seed))
 
+    if not parts:
+        return df.iloc[0:0].reset_index(drop=True)
+
     sampled = pd.concat(parts, ignore_index=True)
     sampled = sampled.sample(frac=1.0, random_state=seed).reset_index(drop=True)
 
