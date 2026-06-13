@@ -220,23 +220,25 @@ deployment takes, so "it works in dev" and "it works deployed" are the same clai
 It logs to `/tmp/shoptalk_{api,ui}.log` (`tail -f` them to watch the ~15-20s model-loading
 boot) and prints the URLs once both processes are launched:
 
-- **API:** `http://localhost:8000/health`
+- **API:** `http://localhost:8010/health`
 - **UI:** `http://localhost:8501`
 
 > **Port collisions:** the script identifies ShopTalk's own processes by full command line
 > (scoped to the `.venv-shoptalk` path) — never by port — so it can never kill an unrelated
-> project's server by mistake. It *can't*, however, fix a case where another project is
-> already bound to `:8000` or `:8501`: if `http://localhost:8000/health` doesn't respond
-> the way `docs/PROJECT_REPORT.md` §6.1 describes, run `lsof -nP -iTCP:8000 -sTCP:LISTEN`
-> to see what's actually listening there, and either stop that other process or change
-> `configs/config.yaml: api.port` / run Streamlit with `--server.port`.
+> project's server by mistake. ShopTalk's API defaults to **`:8010`** (not the more common
+> `:8000`) specifically to avoid colliding with other local dev servers. It *can't*,
+> however, fix a case where another project is already bound to `:8010` or `:8501`: if
+> `http://localhost:8010/health` doesn't respond the way `docs/PROJECT_REPORT.md` §6.1
+> describes, run `lsof -nP -iTCP:8010 -sTCP:LISTEN` to see what's actually listening there,
+> and either stop that other process or change `configs/config.yaml: api.port` /
+> `ui.api_base_url` (and the `--port` below) / run Streamlit with `--server.port`.
 
 **The manual way** (two terminals — useful for watching each process's logs directly):
 
 ```bash
 # Terminal 1 — the inference API (loads all models ONCE at startup; ~15-20s cold start)
 source .venv-shoptalk/bin/activate
-uvicorn src.api.main:app --host 0.0.0.0 --port 8000
+uvicorn src.api.main:app --host 0.0.0.0 --port 8010
 
 # Terminal 2 — the chat UI (talks to the API at configs/config.yaml: ui.api_base_url)
 source .venv-shoptalk/bin/activate
@@ -326,10 +328,27 @@ is written specifically for Kaggle and documents the workflow end-to-end:
    `data/processed/` for the final enriched corpus) and resume working locally — the rest of
    the pipeline (encoding, indexing, agent, API, UI) runs entirely on the laptop from there.
 
-The same shape applies to fine-tuning: attach the mined hard-negative triplets
-(`src.eval.hard_negatives.mine_hard_negatives`, §6.10 of `docs/PROJECT_REPORT.md`) and the
-base encoder as inputs, run the LoRA training loop from `configs/config.yaml: finetune`
-against a free T4, and pull the resulting adapter weights back into `weights/`.
+**LoRA fine-tuning** follows the same shape, in
+[`notebooks/03_finetune_bge_lora_kaggle.ipynb`](notebooks/03_finetune_bge_lora_kaggle.ipynb):
+
+1. Enable **GPU T4 x2** (Settings → Accelerator) — same `sm_75` rationale as above.
+2. Upload `data/processed/products_enriched.parquet` (or `products.parquet`, if you haven't
+   run captioning yet) as an attached Kaggle Dataset.
+3. Run the cells top to bottom: clone the repo, install only `sentence-transformers` + `peft`
+   (the two packages Kaggle's base image doesn't ship, `--no-deps` to protect the matched ABI
+   stack), then build the training triplets via
+   `src.embeddings.finetune.triplet_mining.build_training_triplets` — this also runs the
+   eval-integrity gate (`assert_eval_integrity`), failing fast if any golden-set product or
+   query would leak into training.
+4. The notebook computes `separation_margin`/`category_clustering` for the **pretrained**
+   encoder, runs `src.embeddings.finetune.trainer.run()` (the same single-command entrypoint
+   as `python -m src.embeddings.finetune.trainer`, here on a T4 instead of CPU/MPS — typically
+   well under an hour for the dev-scale corpus per `configs/config.yaml: finetune`), then
+   recomputes the same metrics for the **fine-tuned** encoder and prints a before/after table.
+5. **Pull back**: `finetuned-bge-lora-v1.zip` (unzip into
+   `weights/finetuned/bge-base-en-v1.5-lora-v1/`, gitignored) and
+   `finetune_before_after.csv` (the separation-margin/clustering numbers for the Phase-4
+   exit-gate writeup in `docs/ShopTalk_Plan.md`).
 
 ### 3. Containerized deployment (Docker → AWS)
 

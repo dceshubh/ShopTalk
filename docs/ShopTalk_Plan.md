@@ -265,7 +265,34 @@ Every phase below is engineered to produce evidence for these.
 - [ ] **Eval integrity:** golden queries are human-written and distribution-disjoint from synthetic training queries; golden-set products also excluded from mining (assert both).
 - [ ] Documented "modifications": base model, LoRA rank/alpha, loss, negatives strategy, epochs, LR.
 
-**Rubric:** #2 (25) — this is the phase that moves it Good→Excellent. **Artifacts:** LoRA weights, training notebook, fine-tune-vs-pretrained report, distance histograms.
+**Build notes / deviations:**
+- **Code-complete and unit-tested, GPU run pending.** All four pipeline stages are written and
+  covered by 35 passing tests, but actual LoRA training needs a GPU this machine doesn't have
+  (per §8) — the exit-gate boxes above stay unchecked until `notebooks/03_finetune_bge_lora_kaggle.ipynb`
+  has been run on Kaggle and its before/after numbers recorded here.
+- `src/embeddings/finetune/query_generation.py`: templates each product's own structured
+  attributes (`product_type`, `color`, `material`, `brand`) into shopper-style queries
+  (e.g. "wool blue chair") — deliberately a *different style* from the hand-written golden
+  queries, so "fine-tuned beats pretrained" can't be a templating artifact.
+- `src/embeddings/finetune/triplet_mining.py`: mines **attribute hard negatives** — for a
+  (query, positive) pair, another product of the same `product_type` but a different
+  `color`/`material` (a teal table is a hard negative for "walnut table"). Folds in real
+  feedback-derived hard negatives (closing the Phase 9 → Phase 4 loop). `assert_eval_integrity`
+  is the literal eval-integrity gate: raises `AssertionError` if any training triplet
+  references a golden-set product, or any training query exactly matches a hand-written
+  golden query.
+- `src/embeddings/finetune/metrics.py`: `separation_margin` (mean `cos(query, positive) -
+  cos(query, negative)` over triplets) and `category_clustering` (intra- vs inter-`product_type`
+  mean cosine over a sample) — both operate on raw encoder embeddings, no Chroma index needed.
+- `src/embeddings/finetune/trainer.py`: `apply_lora` wraps `model[0].auto_model` (the
+  underlying BERT-family transformer) with a `peft` LoRA adapter on the `query`/`key`/`value`
+  attention projections; `train` fine-tunes with `MultipleNegativesRankingLoss` via
+  `sentence-transformers`' `model.fit`. Hyperparameters come from `finetune` in
+  `configs/config.yaml` (r=16, alpha=32, dropout=0.1, epochs=3, batch_size=32, lr=2e-5).
+  Single-command entrypoint: `python -m src.embeddings.finetune.trainer`. Output saved to
+  `weights/finetuned/{base_model}-lora-v1/` (gitignored, path logged).
+
+**Rubric:** #2 (25) — this is the phase that moves it Good→Excellent. **Artifacts:** `src/embeddings/finetune/{query_generation,triplet_mining,metrics,trainer}.py`, 35 passing tests (`tests/test_{query_generation,triplet_mining,finetune_metrics,finetune_trainer}.py`), `notebooks/03_finetune_bge_lora_kaggle.ipynb`, fine-tune-vs-pretrained report (pending GPU run).
 **REVIEW CHECKPOINT 4 →** you confirm the fine-tune is a real, measured improvement.
 
 ---

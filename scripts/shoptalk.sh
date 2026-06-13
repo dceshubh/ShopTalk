@@ -24,10 +24,11 @@ API_LOG="/tmp/shoptalk_api.log"
 UI_LOG="/tmp/shoptalk_ui.log"
 
 # Matched by FULL COMMAND LINE, scoped to THIS project's venv path — not just "uvicorn" or
-# port 8000, both of which can collide with unrelated projects on the same machine (this
-# one, for instance, also runs a separate `Finances Tracker` API on :8000). Two patterns,
-# unioned and de-duped, rather than one alternation regex — keeps this portable across the
-# BSD pgrep on macOS and the GNU pgrep elsewhere.
+# a port number, either of which can collide with unrelated projects on the same machine
+# (this one, for instance, also runs a separate `Finances Tracker` API on :8000 — why
+# ShopTalk's API defaults to :8010, see configs/config.yaml). Two patterns, unioned and
+# de-duped, rather than one alternation regex — keeps this portable across the BSD pgrep
+# on macOS and the GNU pgrep elsewhere.
 _pids() {
   {
     pgrep -f "${VENV_DIR}/bin/uvicorn.*src.api.main" || true
@@ -52,7 +53,7 @@ _kill_existing() {
 _redis_up() { redis-cli ping >/dev/null 2>&1; }
 
 _print_urls() {
-  echo "  API:   http://localhost:8000/health   (logs: $API_LOG)"
+  echo "  API:   http://localhost:8010/health   (logs: $API_LOG)"
   echo "  UI:    http://localhost:8501           (logs: $UI_LOG)"
 }
 
@@ -94,7 +95,7 @@ case "${1:-up}" in
     fi
 
     echo "Starting API…"
-    nohup "${VENV_DIR}/bin/uvicorn" src.api.main:app --host 0.0.0.0 --port 8000 >"$API_LOG" 2>&1 &
+    nohup "${VENV_DIR}/bin/uvicorn" src.api.main:app --host 0.0.0.0 --port 8010 >"$API_LOG" 2>&1 &
     disown
 
     echo "Starting UI…"

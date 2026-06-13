@@ -97,10 +97,14 @@ agent:
 
 api:
   host: "0.0.0.0"
-  port: 8000
+  # 8010, not 8000 — 8000 is a common default for other local dev servers (this machine
+  # had an unrelated `Finances Tracker` uvicorn squatting on :8000, silently breaking
+  # ShopTalk's own localhost routing; see docs/PROJECT_REPORT.md §6.1). 8010 is unlikely
+  # to collide. Docker/compose are unaffected — container ports are set in docker-compose.yml.
+  port: 8010
 
 ui:
-  api_base_url: "http://localhost:8000"
+  api_base_url: "http://localhost:8010"
   title: "ShopTalk"
 
 logging:

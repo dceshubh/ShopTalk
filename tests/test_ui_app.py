@@ -70,7 +70,7 @@ def test_config_falls_back_to_the_yaml_default_when_the_env_var_is_unset(monkeyp
 
     api_base_url, _title = _config()
 
-    assert api_base_url == "http://localhost:8000"  # configs/config.yaml: ui.api_base_url
+    assert api_base_url == "http://localhost:8010"  # configs/config.yaml: ui.api_base_url
 
 
 # ---------------------------------------------------------------------------
